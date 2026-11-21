@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from app.api.media import router as media_router
+from app.routers.rag import router as rag_router
 
 app = FastAPI(
     title="EchoTrace",
@@ -9,6 +10,7 @@ app = FastAPI(
 
 # Register API routers
 app.include_router(media_router)
+app.include_router(rag_router)
 
 
 @app.get("/")
