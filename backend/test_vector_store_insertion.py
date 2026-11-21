@@ -103,10 +103,11 @@ class TestVectorStoreInsertion(unittest.TestCase):
             recording_id, chunks, embeddings
         )
 
+        ver = result["version"]
         expected_ids = [
-            f"{recording_id}_000000",
-            f"{recording_id}_000001",
-            f"{recording_id}_000002",
+            f"{recording_id}_v_{ver}_000000",
+            f"{recording_id}_v_{ver}_000001",
+            f"{recording_id}_v_{ver}_000002",
         ]
 
         self.assertEqual(result["recording_id"], recording_id)
@@ -212,16 +213,19 @@ class TestVectorStoreInsertion(unittest.TestCase):
         # Upsert must update existing IDs, not create duplicates.
         self.assertEqual(collection.count(), 2)
 
+        ver2 = second_result["version"]
+        expected_second_ids = [
+            f"{recording_id}_v_{ver2}_000000",
+            f"{recording_id}_v_{ver2}_000001",
+        ]
+
         stored = collection.get(
-            ids=[
-                f"{recording_id}_000000",
-                f"{recording_id}_000001",
-            ],
+            ids=expected_second_ids,
             include=["documents", "metadatas", "embeddings"],
         )
 
-        idx_0 = stored["ids"].index(f"{recording_id}_000000")
-        idx_1 = stored["ids"].index(f"{recording_id}_000001")
+        idx_0 = stored["ids"].index(expected_second_ids[0])
+        idx_1 = stored["ids"].index(expected_second_ids[1])
 
         self.assertEqual(
             stored["documents"][idx_0],
@@ -410,8 +414,8 @@ class TestVectorStoreInsertion(unittest.TestCase):
             rec_b, chunks_b, embeddings_b
         )
 
-        expected_id_a = f"{rec_a}_000000"
-        expected_id_b = f"{rec_b}_000000"
+        expected_id_a = f"{rec_a}_v_{result_a['version']}_000000"
+        expected_id_b = f"{rec_b}_v_{result_b['version']}_000000"
 
         self.assertEqual(result_a["ids"], [expected_id_a])
         self.assertEqual(result_b["ids"], [expected_id_b])
@@ -465,6 +469,227 @@ class TestVectorStoreInsertion(unittest.TestCase):
         )
 
         self.assertTrue(self.temp_path.exists())
+
+
+class TestVectorStoreReingestionAndPruning(unittest.TestCase):
+    """
+    Verifies that re-ingesting a recording with fewer chunks safely prunes obsolete
+    chunks from ChromaDB without delete-then-upsert data loss, preserving other recordings
+    and protecting old data if validation or upsert fails.
+    """
+
+    def setUp(self):
+        if sys.version_info >= (3, 10):
+            self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        else:
+            self.temp_dir = tempfile.TemporaryDirectory()
+
+        self.temp_path = Path(self.temp_dir.name)
+        self.patcher = mock.patch(
+            "app.services.vector_store_service.CHROMA_DATA_DIR",
+            self.temp_path,
+        )
+        self.patcher.start()
+
+    def tearDown(self):
+        SharedSystemClient.clear_system_cache()
+        self.patcher.stop()
+        try:
+            self.temp_dir.cleanup()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _create_embedding(fill_value: float = 0.05) -> list[float]:
+        return [float(fill_value)] * 768
+
+    @staticmethod
+    def _create_chunk(chunk_index: int, start: float, end: float, text: str) -> dict:
+        return {
+            "chunk_index": chunk_index,
+            "start": float(start),
+            "end": float(end),
+            "text": text,
+            "segment_count": 1,
+        }
+
+    def _get_collection(self):
+        return vector_store_service.get_vector_collection()
+
+    def test_reingest_fewer_chunks_prunes_obsolete_chunks(self):
+        """
+        Re-ingesting 10 chunks as 4 chunks must result in exactly the new 4 chunks
+        being stored; obsolete chunks (indices 4..9) must be removed.
+        """
+        recording_id = "rec-reingest-fewer"
+
+        # Initial ingestion: 10 chunks (0..9)
+        initial_chunks = [
+            self._create_chunk(i, i * 5.0, (i + 1) * 5.0, f"Initial chunk {i}")
+            for i in range(10)
+        ]
+        initial_embeddings = [self._create_embedding(0.1 * (i + 1)) for i in range(10)]
+
+        res_initial = vector_store_service.store_transcript_chunks(
+            recording_id, initial_chunks, initial_embeddings
+        )
+        self.assertEqual(res_initial["stored_count"], 10)
+
+        collection = self._get_collection()
+        self.assertEqual(collection.count(), 10)
+
+        # Replacement ingestion: only 4 chunks (0..3)
+        replacement_chunks = [
+            self._create_chunk(i, i * 5.0, (i + 1) * 5.0, f"Replacement chunk {i}")
+            for i in range(4)
+        ]
+        replacement_embeddings = [self._create_embedding(0.05 * (i + 1)) for i in range(4)]
+
+        res_replace = vector_store_service.store_transcript_chunks(
+            recording_id, replacement_chunks, replacement_embeddings
+        )
+        self.assertEqual(res_replace["stored_count"], 4)
+
+        # Verify only the 4 replacement chunks remain in the collection
+        self.assertEqual(collection.count(), 4)
+
+        stored = collection.get(where={"recording_id": recording_id})
+        expected_ids = set(res_replace["ids"])
+        self.assertEqual(set(stored["ids"]), expected_ids)
+
+        # Verify obsolete chunks from initial ingestion are no longer in ChromaDB
+        initial_ids = res_initial["ids"]
+        check_obsolete = collection.get(ids=initial_ids)
+        self.assertEqual(len(check_obsolete["ids"]), 0)
+
+    def test_reingest_one_recording_without_affecting_another(self):
+        """Re-ingesting recording A does not prune or modify chunks belonging to recording B."""
+        rec_a = "rec-reingest-target-a"
+        rec_b = "rec-reingest-target-b"
+
+        chunks_a = [self._create_chunk(i, i * 2.0, (i + 1) * 2.0, f"A chunk {i}") for i in range(6)]
+        embeddings_a = [self._create_embedding(0.1) for _ in range(6)]
+
+        chunks_b = [self._create_chunk(i, i * 2.0, (i + 1) * 2.0, f"B chunk {i}") for i in range(5)]
+        embeddings_b = [self._create_embedding(0.2) for _ in range(5)]
+
+        vector_store_service.store_transcript_chunks(rec_a, chunks_a, embeddings_a)
+        vector_store_service.store_transcript_chunks(rec_b, chunks_b, embeddings_b)
+
+        collection = self._get_collection()
+        self.assertEqual(collection.count(), 11)
+
+        # Re-ingest rec_a with only 2 chunks
+        new_chunks_a = [self._create_chunk(i, i * 2.0, (i + 1) * 2.0, f"New A {i}") for i in range(2)]
+        new_embeddings_a = [self._create_embedding(0.3) for _ in range(2)]
+
+        vector_store_service.store_transcript_chunks(rec_a, new_chunks_a, new_embeddings_a)
+
+        # Collection should now contain: 2 (rec_a) + 5 (rec_b) = 7 total chunks
+        self.assertEqual(collection.count(), 7)
+
+        # Verify all 5 chunks of rec_b remain untouched
+        b_records = collection.get(where={"recording_id": rec_b})
+        self.assertEqual(len(b_records["ids"]), 5)
+
+    def test_validation_failure_preserves_old_data(self):
+        """If validation fails on replacement chunks, existing ChromaDB data remains intact."""
+        recording_id = "rec-val-fail-safe"
+
+        chunks = [self._create_chunk(i, i * 5.0, (i + 1) * 5.0, f"Old chunk {i}") for i in range(5)]
+        embeddings = [self._create_embedding(0.1) for _ in range(5)]
+
+        vector_store_service.store_transcript_chunks(recording_id, chunks, embeddings)
+        collection = self._get_collection()
+        self.assertEqual(collection.count(), 5)
+
+        # Attempt replacement with an invalid chunk (end < start)
+        invalid_chunks = [
+            self._create_chunk(0, 10.0, 5.0, "Invalid timestamp chunk")  # end < start
+        ]
+        invalid_embeddings = [self._create_embedding(0.1)]
+
+        with self.assertRaises(ValidationError):
+            vector_store_service.store_transcript_chunks(
+                recording_id, invalid_chunks, invalid_embeddings
+            )
+
+        # Old data must remain completely intact
+        self.assertEqual(collection.count(), 5)
+        records = collection.get(where={"recording_id": recording_id})
+        self.assertEqual(len(records["ids"]), 5)
+
+    def test_upsert_failure_preserves_old_data(self):
+        """If collection.upsert fails, old data is preserved and delete is never called."""
+        recording_id = "rec-upsert-fail-safe"
+
+        chunks = [self._create_chunk(i, i * 5.0, (i + 1) * 5.0, f"Old chunk {i}") for i in range(5)]
+        embeddings = [self._create_embedding(0.1) for _ in range(5)]
+
+        vector_store_service.store_transcript_chunks(recording_id, chunks, embeddings)
+        collection = self._get_collection()
+        self.assertEqual(collection.count(), 5)
+
+        # Attempt replacement with upsert mocked to fail
+        replacement_chunks = [self._create_chunk(0, 0.0, 5.0, "New chunk")]
+        replacement_embeddings = [self._create_embedding(0.2)]
+
+        real_coll = vector_store_service.get_vector_collection()
+        mock_delete = mock.MagicMock()
+
+        proxy_coll = mock.MagicMock()
+        proxy_coll.get.side_effect = real_coll.get
+        proxy_coll.upsert.side_effect = RuntimeError("Disk write failed")
+        proxy_coll.delete = mock_delete
+
+        with mock.patch("app.services.vector_store_service.get_vector_collection", return_value=proxy_coll):
+            with self.assertRaises(RuntimeError):
+                vector_store_service.store_transcript_chunks(
+                    recording_id, replacement_chunks, replacement_embeddings
+                )
+
+        # Verify delete was never called!
+        mock_delete.assert_not_called()
+
+        # Existing chunks remain untouched
+        records = collection.get(where={"recording_id": recording_id})
+        self.assertEqual(len(records["ids"]), 5)
+
+    def test_obsolete_chunk_cleanup_occurs_only_after_successful_upsert(self):
+        """Verifies order of operations: upsert must precede delete during re-ingestion."""
+        recording_id = "rec-order-verification"
+
+        chunks = [self._create_chunk(i, i * 5.0, (i + 1) * 5.0, f"Old chunk {i}") for i in range(5)]
+        embeddings = [self._create_embedding(0.1) for _ in range(5)]
+
+        vector_store_service.store_transcript_chunks(recording_id, chunks, embeddings)
+        real_coll = vector_store_service.get_vector_collection()
+
+        call_order = []
+        proxy_coll = mock.MagicMock()
+        proxy_coll.get.side_effect = real_coll.get
+
+        def tracked_upsert(*args, **kwargs):
+            call_order.append("upsert")
+            return real_coll.upsert(*args, **kwargs)
+
+        def tracked_delete(*args, **kwargs):
+            call_order.append("delete")
+            return real_coll.delete(*args, **kwargs)
+
+        proxy_coll.upsert.side_effect = tracked_upsert
+        proxy_coll.delete.side_effect = tracked_delete
+
+        with mock.patch("app.services.vector_store_service.get_vector_collection", return_value=proxy_coll):
+            new_chunks = [self._create_chunk(0, 0.0, 5.0, "Single chunk")]
+            new_embeddings = [self._create_embedding(0.2)]
+
+            vector_store_service.store_transcript_chunks(
+                recording_id, new_chunks, new_embeddings
+            )
+
+        self.assertEqual(call_order, ["upsert", "delete"])
+        self.assertEqual(real_coll.count(), 1)
 
 
 if __name__ == "__main__":

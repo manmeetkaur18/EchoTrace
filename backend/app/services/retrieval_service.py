@@ -1,8 +1,15 @@
 import logging
 import math
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+from chromadb.api.models.Collection import Collection
 
 from app.services.embedding_service import embed_query
+from app.services.registry_service import (
+    RegistryError,
+    get_active_version,
+    list_active_versions,
+)
 from app.services.vector_store_service import get_vector_collection
 
 # Configure module logger for server-side diagnostics
@@ -26,27 +33,37 @@ def search_transcript_chunks(
     query: str,
     recording_id: Optional[str] = None,
     top_k: int = 5,
+    db_path: Optional[Union[str, Path]] = None,
+    collection: Optional[Collection] = None,
 ) -> List[Dict[str, Any]]:
     """
     Searches indexed transcript chunks using vector similarity (cosine distance).
 
-    Flow:
+    Versioned Retrieval Flow:
     1. Validates input parameters (query, recording_id, top_k).
-    2. Obtains the persistent ChromaDB collection.
-    3. Handles an empty collection gracefully by returning an empty list without unnecessary queries.
-    4. Generates a 768-dimensional query embedding via embed_query().
-    5. Queries ChromaDB using cosine distance, optionally filtered by recording_id.
-    6. Safely extracts, validates, and formats matching chunk results.
+    2. If recording_id is provided, queries the active-version registry:
+       - If active version exists: applies compound filter {"$and": [{"recording_id": ...}, {"version": active_version}]}.
+       - If registry confirms no entry (legacy recording): retains legacy {"recording_id": ...} filter.
+       - If registry is unavailable or corrupted: fails safely by raising RuntimeError (NEVER falls back to unfiltered/legacy!).
+    3. If recording_id is None (global search): validates active versions map from registry to filter out
+       superseded or unactivated version chunks at response time.
+    4. Obtains the persistent ChromaDB collection.
+    5. Handles empty collections gracefully by returning an empty list without unnecessary queries.
+    6. Generates a 768-dimensional query embedding via embed_query().
+    7. Queries ChromaDB using cosine distance and safe where-filter.
+    8. Validates and formats matching chunk results, preserving timestamps, chunk IDs, and distances.
 
     Args:
         query (str): User natural language search query.
         recording_id (Optional[str]): Optional recording ID to scope results to a single media file.
         top_k (int): Maximum number of top matching chunks to retrieve (default: 5).
+        db_path (Optional[Union[str, Path]]): Optional path to SQLite registry (for test isolation).
+        collection (Optional[Collection]): Optional ChromaDB collection instance (for test isolation).
 
     Returns:
         List[Dict[str, Any]]: Ranked list of matching chunks sorted by cosine distance (lower is better),
         where each item contains:
-            - chunk_id (str): Unique chunk identifier (e.g., '{recording_id}_{chunk_index:06d}').
+            - chunk_id (str): Unique chunk identifier (e.g., '{recording_id}_v_{version}_{chunk_index:06d}').
             - recording_id (str): ID of the media recording this chunk belongs to.
             - chunk_index (int): Sequential index of the chunk within the recording.
             - start (float): Timestamp in seconds marking the start of the chunk.
@@ -55,9 +72,9 @@ def search_transcript_chunks(
             - distance (float): Cosine distance between query and chunk embedding.
 
     Raises:
-        TypeError: If query, recording_id, or top_k are of invalid types (or boolean where numeric/string expected).
+        TypeError: If query, recording_id, or top_k are of invalid types.
         ValueError: If query or recording_id are empty/whitespace, or top_k <= 0.
-        RuntimeError: If embedding generation or ChromaDB query fails.
+        RuntimeError: If embedding generation, registry resolution, or ChromaDB query fails.
     """
     # ---------------------------------------------------------
     # 1. Input Validation
@@ -88,21 +105,81 @@ def search_transcript_chunks(
         raise ValueError(f"top_k must be a positive integer greater than 0, got {top_k}.")
 
     # ---------------------------------------------------------
-    # 2. ChromaDB Collection Access & Empty Collection Check
+    # 2. Resolve Active Version from Registry
     # ---------------------------------------------------------
-    try:
-        collection = get_vector_collection()
-    except Exception as exc:
-        logger.error(
-            "Failed to access ChromaDB collection: %s",
-            type(exc).__name__,
-        )
-        raise RuntimeError(
-            f"Failed to access vector collection: {type(exc).__name__}."
-        ) from exc
+    where_filter: Optional[Dict[str, Any]] = None
+    active_versions_map: Optional[Dict[str, str]] = None
+
+    if clean_recording_id is not None:
+        try:
+            active_version = get_active_version(clean_recording_id, db_path=db_path)
+        except RegistryError as reg_err:
+            logger.error(
+                "Registry error while resolving active version for recording '%s': %s",
+                clean_recording_id,
+                reg_err,
+            )
+            raise RuntimeError(
+                f"Active-version registry error for recording '{clean_recording_id}': {type(reg_err).__name__}."
+            ) from reg_err
+        except Exception as exc:
+            logger.error(
+                "Unexpected error accessing active-version registry for recording '%s': %s",
+                clean_recording_id,
+                exc,
+            )
+            raise RuntimeError(
+                f"Active-version registry unavailable for recording '{clean_recording_id}': {type(exc).__name__}."
+            ) from exc
+
+        if active_version is not None:
+            # Versioned recording: query must match both recording_id and active version
+            where_filter = {
+                "$and": [
+                    {"recording_id": clean_recording_id},
+                    {"version": active_version},
+                ]
+            }
+            logger.info(
+                "Retrieval scoped to versioned recording '%s' (active version: '%s').",
+                clean_recording_id,
+                active_version,
+            )
+        else:
+            # Unversioned legacy recording: registry confirmed no entry, use legacy filter
+            where_filter = {"recording_id": clean_recording_id}
+            logger.info(
+                "Retrieval scoped to legacy unversioned recording '%s'.",
+                clean_recording_id,
+            )
+    else:
+        # Global search: load active versions mapping to filter out inactive chunks post-query
+        try:
+            active_versions_map = list_active_versions(db_path=db_path)
+        except Exception as exc:
+            logger.error("Failed to query active versions map for global retrieval: %s", exc)
+            raise RuntimeError("Active-version registry unavailable for vector search.") from exc
+
+    # ---------------------------------------------------------
+    # 3. ChromaDB Collection Access & Empty Collection Check
+    # ---------------------------------------------------------
+    target_col: Collection
+    if collection is not None:
+        target_col = collection
+    else:
+        try:
+            target_col = get_vector_collection()
+        except Exception as exc:
+            logger.error(
+                "Failed to access ChromaDB collection: %s",
+                type(exc).__name__,
+            )
+            raise RuntimeError(
+                f"Failed to access vector collection: {type(exc).__name__}."
+            ) from exc
 
     try:
-        total_records = collection.count()
+        total_records = target_col.count()
     except Exception as exc:
         logger.error(
             "Failed to retrieve record count from ChromaDB: %s",
@@ -120,7 +197,7 @@ def search_transcript_chunks(
         return []
 
     # ---------------------------------------------------------
-    # 3. Query Embedding Generation
+    # 4. Query Embedding Generation
     # ---------------------------------------------------------
     logger.info(
         "Generating query embedding (query_length=%d chars)...",
@@ -139,16 +216,13 @@ def search_transcript_chunks(
         ) from exc
 
     # ---------------------------------------------------------
-    # 4. ChromaDB Vector Query Execution
+    # 5. ChromaDB Vector Query Execution
     # ---------------------------------------------------------
-    where_filter: Optional[Dict[str, Any]] = (
-        {"recording_id": clean_recording_id} if clean_recording_id else None
-    )
-
     logger.info(
-        "Executing ChromaDB query (top_k=%d, scoped_recording_id=%s)...",
+        "Executing ChromaDB query (top_k=%d, scoped_recording_id=%s, filter=%s)...",
         top_k,
         clean_recording_id,
+        where_filter,
     )
 
     query_kwargs: Dict[str, Any] = {
@@ -160,7 +234,7 @@ def search_transcript_chunks(
         query_kwargs["where"] = where_filter
 
     try:
-        raw_results = collection.query(**query_kwargs)
+        raw_results = target_col.query(**query_kwargs)
     except Exception as exc:
         logger.error(
             "ChromaDB vector search query failed: %s",
@@ -171,9 +245,8 @@ def search_transcript_chunks(
         ) from exc
 
     # ---------------------------------------------------------
-    # 5. Response Processing & Result Sanitization
+    # 6. Response Processing & Result Sanitization
     # ---------------------------------------------------------
-    # ChromaDB returns nested lists for batch queries; safely access first query results
     ids_batch = raw_results.get("ids") or []
     docs_batch = raw_results.get("documents") or []
     metas_batch = raw_results.get("metadatas") or []
@@ -215,6 +288,7 @@ def search_transcript_chunks(
         chunk_idx = meta.get("chunk_index")
         start = meta.get("start")
         end = meta.get("end")
+        chunk_ver = meta.get("version")
 
         # Validate recording_id
         if not isinstance(rec_id, str) or not rec_id.strip():
@@ -224,6 +298,52 @@ def search_transcript_chunks(
                 idx,
             )
             continue
+        clean_rec = str(rec_id).strip()
+
+        # Ensure inactive or abandoned version chunks are excluded (for both scoped and global queries)
+        if clean_recording_id is not None:
+            if active_version is not None:
+                if chunk_ver != active_version:
+                    logger.warning(
+                        "Skipping chunk %s for recording %s: chunk version '%s' != active version '%s'.",
+                        clean_chunk_id,
+                        clean_rec,
+                        chunk_ver,
+                        active_version,
+                    )
+                    continue
+            else:
+                # Legacy recording: exclude chunks tagged with an unactivated version
+                if chunk_ver is not None:
+                    logger.warning(
+                        "Skipping chunk %s for legacy recording %s: contains unactivated version tag '%s'.",
+                        clean_chunk_id,
+                        clean_rec,
+                        chunk_ver,
+                    )
+                    continue
+        elif active_versions_map is not None:
+            if clean_rec in active_versions_map:
+                active_ver = active_versions_map[clean_rec]
+                if chunk_ver != active_ver:
+                    logger.warning(
+                        "Skipping chunk %s for recording %s: chunk version '%s' != active version '%s'.",
+                        clean_chunk_id,
+                        clean_rec,
+                        chunk_ver,
+                        active_ver,
+                    )
+                    continue
+            else:
+                # Legacy recording: exclude chunks tagged with an unactivated version
+                if chunk_ver is not None:
+                    logger.warning(
+                        "Skipping chunk %s for legacy recording %s: contains unactivated version tag '%s'.",
+                        clean_chunk_id,
+                        clean_rec,
+                        chunk_ver,
+                    )
+                    continue
 
         # Validate numeric fields with OverflowError/TypeError guards
         try:
@@ -287,7 +407,7 @@ def search_transcript_chunks(
 
         formatted_results.append({
             "chunk_id": clean_chunk_id,
-            "recording_id": str(rec_id).strip(),
+            "recording_id": clean_rec,
             "chunk_index": i_chunk_idx,
             "start": f_start,
             "end": f_end,

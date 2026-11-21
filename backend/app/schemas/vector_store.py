@@ -1,5 +1,5 @@
 import math
-from typing import Any
+from typing import Any, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
@@ -55,11 +55,26 @@ class TranscriptChunkRecord(BaseModel):
         ...,
         description="768-dimensional float embedding vector.",
     )
+    version: Optional[str] = Field(
+        default=None,
+        description="UUID-based version identifier for isolated versioned vector storage.",
+    )
 
     # ---------------------------------------------------------
     # Field Validators (mode="before" intercepts raw inputs to reject booleans and convert types)
     # Raising ValueError allows Pydantic to wrap all validation failures into ValidationError
     # ---------------------------------------------------------
+    @field_validator("version", mode="before")
+    @classmethod
+    def validate_version(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        if isinstance(v, bool) or not isinstance(v, str):
+            raise ValueError("version must be a string or None.")
+        cleaned = v.strip()
+        if not cleaned:
+            raise ValueError("version must not be empty or whitespace-only if provided.")
+        return cleaned
     @field_validator("recording_id", mode="before")
     @classmethod
     def validate_recording_id(cls, v: Any) -> str:
