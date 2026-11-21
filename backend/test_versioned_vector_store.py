@@ -236,6 +236,7 @@ class TestVersionedVectorStoreRegression(unittest.TestCase):
         )
 
         # Activate V2 in SQLite
+        stage_version(rec_id, v2_id, expected_generation=0, db_path=self.test_db_path)
         activate_version(rec_id, v2_id, expected_generation=0, db_path=self.test_db_path)
 
         with patch("app.services.retrieval_service.embed_query", return_value=self.mock_embedding):
@@ -510,11 +511,13 @@ class TestVersionedVectorStoreRegression(unittest.TestCase):
         self.assertEqual(gen1, 1)
 
         v2_id = "v2-fast-job-uuid"
+        stage_version(rec_id, v2_id, expected_generation=1, db_path=self.test_db_path)
         activate_version(rec_id, v2_id, expected_generation=1, db_path=self.test_db_path)
         self.assertEqual(get_recording_generation(rec_id, db_path=self.test_db_path), 2)
         self.assertEqual(get_active_version(rec_id, db_path=self.test_db_path), v2_id)
 
         v1_stale = "v1-slow-stale-uuid"
+        stage_version(rec_id, v1_stale, expected_generation=1, db_path=self.test_db_path)
         with self.assertRaises(StaleVersionError) as ctx:
             activate_version(rec_id, v1_stale, expected_generation=1, db_path=self.test_db_path)
         self.assertIn("Generation mismatch", str(ctx.exception))
@@ -627,6 +630,7 @@ class TestVersionedVectorStoreRegression(unittest.TestCase):
             ],
         )
 
+        stage_version(rec_id, v_active, expected_generation=0, db_path=self.test_db_path)
         activate_version(rec_id, v_active, expected_generation=0, db_path=self.test_db_path)
 
         with patch("app.services.retrieval_service.embed_query", return_value=self.mock_embedding):
@@ -999,6 +1003,377 @@ class TestVersionedVectorStoreRegression(unittest.TestCase):
             )
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0]["chunk_id"], legacy_id)
+
+    # ---------------------------------------------------------
+    # Phase 2.6 Test A — Staged version marked failed cannot be activated
+    # ---------------------------------------------------------
+    def test_failed_version_cannot_be_activated(self):
+        """
+        A. test_failed_version_cannot_be_activated:
+        Stage V2, mark V2 failed, attempt activation -> must raise StaleVersionError.
+        Confirm V1 remains active and V2 remains failed.
+        """
+        rec_id = "rec-phase26-a-fail-act"
+        # 1. Ingest V1
+        res_v1 = vector_store_service.store_transcript_chunks(
+            recording_id=rec_id,
+            chunks=[self._create_chunk(0, 0.0, 5.0, "V1 active text")],
+            embeddings=[self._create_embedding(0.1)],
+            db_path=self.test_db_path,
+            collection=self.collection,
+        )
+        v1_id = res_v1["version"]
+        self.assertEqual(get_active_version(rec_id, db_path=self.test_db_path), v1_id)
+
+        # 2. Stage V2 and mark failed
+        v2_id = "v2-marked-failed"
+        stage_version(rec_id, v2_id, expected_generation=1, db_path=self.test_db_path)
+        marked = registry_service.mark_version_failed(rec_id, v2_id, db_path=self.test_db_path)
+        self.assertTrue(marked)
+        self.assertEqual(
+            registry_service.get_version_statuses(rec_id, db_path=self.test_db_path).get(v2_id),
+            "failed",
+        )
+
+        # 3. Attempt activation -> must raise StaleVersionError
+        with self.assertRaises(StaleVersionError) as ctx:
+            activate_version(rec_id, v2_id, expected_generation=1, db_path=self.test_db_path)
+        self.assertIn("not in staged status", str(ctx.exception).lower())
+
+        # 4. Confirm V1 remains active and V2 remains failed
+        self.assertEqual(get_active_version(rec_id, db_path=self.test_db_path), v1_id)
+        self.assertEqual(
+            registry_service.get_version_statuses(rec_id, db_path=self.test_db_path).get(v2_id),
+            "failed",
+        )
+
+    # ---------------------------------------------------------
+    # Phase 2.6 Test B — Heartbeat failure aborts ingestion
+    # ---------------------------------------------------------
+    def test_heartbeat_failure_aborts_ingestion(self):
+        """
+        B. test_heartbeat_failure_aborts_ingestion:
+        Simulate heartbeat returning False at a checkpoint.
+        Confirm ingestion aborts before activation, and old active version remains searchable.
+        """
+        rec_id = "rec-phase26-b-heartbeat-fail"
+        # 1. Ingest V1
+        res_v1 = vector_store_service.store_transcript_chunks(
+            recording_id=rec_id,
+            chunks=[self._create_chunk(0, 0.0, 5.0, "V1 text for heartbeat test")],
+            embeddings=[self._create_embedding(0.1)],
+            db_path=self.test_db_path,
+            collection=self.collection,
+        )
+        v1_id = res_v1["version"]
+        self.assertEqual(get_active_version(rec_id, db_path=self.test_db_path), v1_id)
+
+        # 2. Ingest V2 with heartbeat returning False
+        v2_id = "v2-hb-fail-candidate"
+        with patch("app.services.vector_store_service.update_version_heartbeat", return_value=False):
+            with self.assertRaises(StaleVersionError) as ctx:
+                vector_store_service.store_transcript_chunks(
+                    recording_id=rec_id,
+                    chunks=[self._create_chunk(0, 0.0, 5.0, "V2 text should abort")],
+                    embeddings=[self._create_embedding(0.2)],
+                    version=v2_id,
+                    db_path=self.test_db_path,
+                    collection=self.collection,
+                )
+            self.assertIn("heartbeat lease expired", str(ctx.exception).lower())
+
+        # 3. Confirm V1 is still active
+        self.assertEqual(get_active_version(rec_id, db_path=self.test_db_path), v1_id)
+        # V2 was not activated
+        self.assertNotEqual(get_active_version(rec_id, db_path=self.test_db_path), v2_id)
+
+        # 4. Confirm old active version remains searchable
+        with patch("app.services.retrieval_service.embed_query", return_value=self.mock_embedding):
+            results = retrieval_service.search_transcript_chunks(
+                query="heartbeat test",
+                recording_id=rec_id,
+                top_k=5,
+                db_path=self.test_db_path,
+                collection=self.collection,
+            )
+            self.assertEqual(len(results), 1)
+            self.assertIn(f"_v_{v1_id}_", results[0]["chunk_id"])
+
+    # ---------------------------------------------------------
+    # Phase 2.6 Test C — Heartbeat registry error aborts ingestion
+    # ---------------------------------------------------------
+    def test_heartbeat_registry_error_aborts_ingestion(self):
+        """
+        C. test_heartbeat_registry_error_aborts_ingestion:
+        Simulate RegistryUnavailableError during heartbeat.
+        Confirm ingestion aborts and no activation occurs.
+        """
+        rec_id = "rec-phase26-c-reg-err"
+        # 1. Ingest V1
+        res_v1 = vector_store_service.store_transcript_chunks(
+            recording_id=rec_id,
+            chunks=[self._create_chunk(0, 0.0, 5.0, "V1 text for registry error test")],
+            embeddings=[self._create_embedding(0.1)],
+            db_path=self.test_db_path,
+            collection=self.collection,
+        )
+        v1_id = res_v1["version"]
+
+        # 2. Ingest V2 with RegistryUnavailableError during heartbeat
+        v2_id = "v2-reg-unavailable-candidate"
+        with patch(
+            "app.services.vector_store_service.update_version_heartbeat",
+            side_effect=RegistryUnavailableError("Simulated SQLite disk corruption during heartbeat"),
+        ):
+            with self.assertRaises(RegistryUnavailableError):
+                vector_store_service.store_transcript_chunks(
+                    recording_id=rec_id,
+                    chunks=[self._create_chunk(0, 0.0, 5.0, "V2 text should fail on reg error")],
+                    embeddings=[self._create_embedding(0.2)],
+                    version=v2_id,
+                    db_path=self.test_db_path,
+                    collection=self.collection,
+                )
+
+        # 3. Confirm no activation occurred, V1 is still active
+        self.assertEqual(get_active_version(rec_id, db_path=self.test_db_path), v1_id)
+
+    # ---------------------------------------------------------
+    # Phase 2.6 Test D — Activation and recovery cannot resurrect failed version
+    # ---------------------------------------------------------
+    def test_activation_and_recovery_cannot_resurrect_failed_version(self):
+        """
+        D. test_activation_and_recovery_cannot_resurrect_failed_version:
+        Stage V2, recover or mark it failed, attempt activation.
+        Confirm it remains failed and V1 remains active.
+        """
+        rec_id = "rec-phase26-d-no-resurrect"
+        # 1. Ingest V1
+        res_v1 = vector_store_service.store_transcript_chunks(
+            recording_id=rec_id,
+            chunks=[self._create_chunk(0, 0.0, 5.0, "V1 initial active")],
+            embeddings=[self._create_embedding(0.1)],
+            db_path=self.test_db_path,
+            collection=self.collection,
+        )
+        v1_id = res_v1["version"]
+
+        # 2. Stage V2 and backdate its timestamp so recovery reaps it
+        v2_id = "v2-expired-and-reaped"
+        stage_version(rec_id, v2_id, expected_generation=1, db_path=self.test_db_path)
+        old_time = time.time() - 500.0
+        with registry_service.get_db_connection(self.test_db_path) as conn:
+            conn.execute(
+                "UPDATE ingestion_versions SET updated_at = ?, created_at = ? WHERE version = ?;",
+                (old_time, old_time, v2_id),
+            )
+
+        # 3. Run recovery
+        recovered = registry_service.recover_stale_staged_versions(
+            recording_id=rec_id,
+            timeout_seconds=300.0,
+            db_path=self.test_db_path,
+        )
+        self.assertIn(v2_id, recovered)
+        self.assertEqual(
+            registry_service.get_version_statuses(rec_id, db_path=self.test_db_path).get(v2_id),
+            "failed",
+        )
+
+        # 4. Attempt activation -> must raise StaleVersionError
+        with self.assertRaises(StaleVersionError):
+            activate_version(rec_id, v2_id, expected_generation=1, db_path=self.test_db_path)
+
+        # 5. Confirm V2 remains failed and V1 remains active
+        self.assertEqual(
+            registry_service.get_version_statuses(rec_id, db_path=self.test_db_path).get(v2_id),
+            "failed",
+        )
+        self.assertEqual(get_active_version(rec_id, db_path=self.test_db_path), v1_id)
+
+    # ---------------------------------------------------------
+    # Phase 2.6 Test E — Global recovery acquires recording locks
+    # ---------------------------------------------------------
+    def test_global_recovery_acquires_recording_locks(self):
+        """
+        E. test_global_recovery_acquires_recording_locks:
+        Create staged versions for multiple recordings.
+        Exercise global recovery.
+        Verify recording locks are acquired individually.
+        Verify recovery still checks the heartbeat cutoff.
+        """
+        rec_1 = "rec-phase26-e-glob-1"
+        rec_2 = "rec-phase26-e-glob-2"
+        rec_3 = "rec-phase26-e-glob-3"
+
+        stage_version(rec_1, "v-glob-1", expected_generation=0, db_path=self.test_db_path)
+        stage_version(rec_2, "v-glob-2", expected_generation=0, db_path=self.test_db_path)
+        stage_version(rec_3, "v-glob-3", expected_generation=0, db_path=self.test_db_path)
+
+        # Make rec_1 and rec_2 expired, but keep rec_3 fresh
+        old_time = time.time() - 600.0
+        with registry_service.get_db_connection(self.test_db_path) as conn:
+            conn.execute(
+                "UPDATE ingestion_versions SET updated_at = ?, created_at = ? WHERE recording_id IN (?, ?);",
+                (old_time, old_time, rec_1, rec_2),
+            )
+
+        locked_recordings = []
+        original_acquire = registry_service.acquire_recording_lock
+
+        from contextlib import contextmanager
+
+        @contextmanager
+        def spy_acquire(r_id, timeout=15.0):
+            locked_recordings.append(r_id)
+            with original_acquire(r_id, timeout=timeout):
+                yield
+
+        with patch("app.services.registry_service.acquire_recording_lock", side_effect=spy_acquire):
+            recovered = registry_service.recover_stale_staged_versions(
+                recording_id=None,
+                timeout_seconds=300.0,
+                db_path=self.test_db_path,
+            )
+
+        # Verified locks acquired individually for candidate recordings
+        self.assertIn(rec_1, locked_recordings)
+        self.assertIn(rec_2, locked_recordings)
+        # rec_3 was not expired, so it was not in candidates
+        self.assertNotIn(rec_3, locked_recordings)
+
+        # Verified recovery checked cutoff: rec_1 and rec_2 marked failed, rec_3 remains staged
+        self.assertIn("v-glob-1", recovered)
+        self.assertIn("v-glob-2", recovered)
+        self.assertNotIn("v-glob-3", recovered)
+
+        statuses_3 = registry_service.get_version_statuses(rec_3, db_path=self.test_db_path)
+        self.assertEqual(statuses_3.get("v-glob-3"), "staged")
+
+    # ---------------------------------------------------------
+    # Phase 2.6 Test F — Failed activation rolls back registry changes
+    # ---------------------------------------------------------
+    def test_failed_activation_rolls_back_registry_changes(self):
+        """
+        F. test_failed_activation_rolls_back_registry_changes:
+        Force the ingestion-version status check or generation CAS to fail.
+        Verify neither registry table is partially updated.
+        """
+        rec_id = "rec-phase26-f-rollback"
+        # 1. Ingest V1
+        res_v1 = vector_store_service.store_transcript_chunks(
+            recording_id=rec_id,
+            chunks=[self._create_chunk(0, 0.0, 5.0, "V1 initial chunk")],
+            embeddings=[self._create_embedding(0.1)],
+            db_path=self.test_db_path,
+            collection=self.collection,
+        )
+        v1_id = res_v1["version"]
+        self.assertEqual(get_recording_generation(rec_id, db_path=self.test_db_path), 1)
+
+        # 2. Stage V2
+        v2_id = "v2-rollback-candidate"
+        stage_version(rec_id, v2_id, expected_generation=1, db_path=self.test_db_path)
+
+        # Case 1: Force generation CAS failure
+        with self.assertRaises(StaleVersionError):
+            activate_version(rec_id, v2_id, expected_generation=999, db_path=self.test_db_path)
+
+        # Verify neither table was partially modified
+        self.assertEqual(get_active_version(rec_id, db_path=self.test_db_path), v1_id)
+        self.assertEqual(get_recording_generation(rec_id, db_path=self.test_db_path), 1)
+        statuses = registry_service.get_version_statuses(rec_id, db_path=self.test_db_path)
+        self.assertEqual(statuses.get(v1_id), "active")
+        self.assertEqual(statuses.get(v2_id), "staged")
+
+        # Case 2: Mark V2 failed, then attempt activation
+        registry_service.mark_version_failed(rec_id, v2_id, db_path=self.test_db_path)
+        with self.assertRaises(StaleVersionError):
+            activate_version(rec_id, v2_id, expected_generation=1, db_path=self.test_db_path)
+
+        # Verify rollback preserved V1 and V2 failed status
+        self.assertEqual(get_active_version(rec_id, db_path=self.test_db_path), v1_id)
+        self.assertEqual(get_recording_generation(rec_id, db_path=self.test_db_path), 1)
+        statuses_after = registry_service.get_version_statuses(rec_id, db_path=self.test_db_path)
+        self.assertEqual(statuses_after.get(v1_id), "active")
+        self.assertEqual(statuses_after.get(v2_id), "failed")
+
+    # ---------------------------------------------------------
+    # Phase 2.6 Test G — Expired ingestion cannot replace active recording
+    # ---------------------------------------------------------
+    def test_expired_ingestion_cannot_replace_active_recording(self):
+        """
+        G. test_expired_ingestion_cannot_replace_active_recording:
+        Simulate an expired V2.
+        Confirm recovery marks it failed.
+        Confirm subsequent activation fails.
+        Confirm retrieval still returns V1.
+        """
+        rec_id = "rec-phase26-g-expired-race"
+        # 1. Ingest V1
+        res_v1 = vector_store_service.store_transcript_chunks(
+            recording_id=rec_id,
+            chunks=[self._create_chunk(0, 0.0, 5.0, "V1 authoritative document")],
+            embeddings=[self._create_embedding(0.1)],
+            db_path=self.test_db_path,
+            collection=self.collection,
+        )
+        v1_id = res_v1["version"]
+
+        # 2. Stage V2 and upsert some partial chunks to ChromaDB
+        v2_id = "v2-expired-attempt"
+        stage_version(rec_id, v2_id, expected_generation=1, db_path=self.test_db_path)
+        v2_chunk_id = f"{rec_id}_v_{v2_id}_000000"
+        self.collection.upsert(
+            ids=[v2_chunk_id],
+            documents=["V2 expired rogue text"],
+            embeddings=[self._create_embedding(0.9)],
+            metadatas=[{
+                "recording_id": rec_id,
+                "version": v2_id,
+                "chunk_index": 0,
+                "start": 0.0,
+                "end": 5.0,
+                "segment_count": 1,
+            }],
+        )
+
+        # 3. Simulate lease expiration
+        old_time = time.time() - 600.0
+        with registry_service.get_db_connection(self.test_db_path) as conn:
+            conn.execute(
+                "UPDATE ingestion_versions SET updated_at = ?, created_at = ? WHERE version = ?;",
+                (old_time, old_time, v2_id),
+            )
+
+        # 4. Recovery marks it failed
+        recovered = registry_service.recover_stale_staged_versions(
+            recording_id=rec_id,
+            timeout_seconds=300.0,
+            db_path=self.test_db_path,
+        )
+        self.assertIn(v2_id, recovered)
+        self.assertEqual(
+            registry_service.get_version_statuses(rec_id, db_path=self.test_db_path).get(v2_id),
+            "failed",
+        )
+
+        # 5. Expired ingestion process wakes up and attempts activation -> must fail
+        with self.assertRaises(StaleVersionError):
+            activate_version(rec_id, v2_id, expected_generation=1, db_path=self.test_db_path)
+
+        # 6. Confirm retrieval still returns V1 and excludes V2
+        with patch("app.services.retrieval_service.embed_query", return_value=self.mock_embedding):
+            results = retrieval_service.search_transcript_chunks(
+                query="authoritative",
+                recording_id=rec_id,
+                top_k=5,
+                db_path=self.test_db_path,
+                collection=self.collection,
+            )
+            self.assertEqual(len(results), 1)
+            self.assertIn(f"_v_{v1_id}_", results[0]["chunk_id"])
+            self.assertNotIn(v2_id, results[0]["chunk_id"])
 
 
 if __name__ == "__main__":

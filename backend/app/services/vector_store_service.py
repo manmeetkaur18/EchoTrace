@@ -9,6 +9,7 @@ from app.schemas.vector_store import TranscriptChunkRecord
 from app.services.registry_service import (
     RegistryError,
     RegistryUnavailableError,
+    StaleVersionError,
     acquire_recording_lock,
     activate_version,
     get_active_version,
@@ -308,7 +309,11 @@ def store_transcript_chunks(
             target_col = collection if collection is not None else get_vector_collection()
 
             # Heartbeat checkpoint 1: prior to ChromaDB upsert
-            update_version_heartbeat(clean_recording_id, version_id, db_path=db_path)
+            if not update_version_heartbeat(clean_recording_id, version_id, db_path=db_path):
+                raise StaleVersionError(
+                    f"Ingestion aborted for recording '{clean_recording_id}' version '{version_id}': "
+                    f"heartbeat lease expired or version is no longer staged."
+                )
 
             # ---------------------------------------------------------
             # 6. Upsert Versioned Chunks into ChromaDB
@@ -328,7 +333,11 @@ def store_transcript_chunks(
             )
 
             # Heartbeat checkpoint 2: prior to verification
-            update_version_heartbeat(clean_recording_id, version_id, db_path=db_path)
+            if not update_version_heartbeat(clean_recording_id, version_id, db_path=db_path):
+                raise StaleVersionError(
+                    f"Ingestion aborted for recording '{clean_recording_id}' version '{version_id}': "
+                    f"heartbeat lease expired or version is no longer staged."
+                )
 
             # ---------------------------------------------------------
             # 7. Verification: Confirm all expected new chunks and metadata exist
@@ -371,7 +380,11 @@ def store_transcript_chunks(
             )
 
             # Heartbeat checkpoint 3: prior to activation
-            update_version_heartbeat(clean_recording_id, version_id, db_path=db_path)
+            if not update_version_heartbeat(clean_recording_id, version_id, db_path=db_path):
+                raise StaleVersionError(
+                    f"Ingestion aborted for recording '{clean_recording_id}' version '{version_id}': "
+                    f"heartbeat lease expired or version is no longer staged."
+                )
 
             # ---------------------------------------------------------
             # 8. Atomically Activate Version in SQLite Registry
@@ -394,7 +407,7 @@ def store_transcript_chunks(
         except Exception as exc:
             # Mark version failed ONLY if failure occurred before successful activation
             if not version_activated:
-                logger.exception(
+                logger.warning(
                     "Ingestion failed before activation for recording '%s' version '%s': %s",
                     clean_recording_id,
                     version_id,

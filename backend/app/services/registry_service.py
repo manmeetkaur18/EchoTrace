@@ -368,37 +368,31 @@ def update_version_heartbeat(
     Ensures long-running ingestions do not get considered stale by recovery.
 
     Returns:
-        bool: True if a staged version row was updated, False otherwise.
+        bool: True if a staged version row was updated, False if the version is no longer staged.
+
+    Raises:
+        RegistryUnavailableError: If SQLite connection or execution fails.
     """
     clean_rec_id = str(recording_id).strip()
     clean_version = str(version).strip()
     now = time.time()
 
-    try:
-        with get_db_connection(db_path) as conn:
-            conn.execute("BEGIN IMMEDIATE;")
-            try:
-                cursor = conn.execute(
-                    """
-                    UPDATE ingestion_versions
-                    SET updated_at = ?
-                    WHERE recording_id = ? AND version = ? AND status = 'staged';
-                    """,
-                    (now, clean_rec_id, clean_version),
-                )
-                conn.execute("COMMIT;")
-                return cursor.rowcount > 0
-            except Exception:
-                conn.execute("ROLLBACK;")
-                raise
-    except Exception as exc:
-        logger.warning(
-            "Failed to update heartbeat for recording '%s' version '%s': %s",
-            clean_rec_id,
-            clean_version,
-            exc,
-        )
-        return False
+    with get_db_connection(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE;")
+        try:
+            cursor = conn.execute(
+                """
+                UPDATE ingestion_versions
+                SET updated_at = ?
+                WHERE recording_id = ? AND version = ? AND status = 'staged';
+                """,
+                (now, clean_rec_id, clean_version),
+            )
+            conn.execute("COMMIT;")
+            return cursor.rowcount > 0
+        except Exception:
+            conn.execute("ROLLBACK;")
+            raise
 
 
 def activate_version(
@@ -414,14 +408,17 @@ def activate_version(
     - Atomically updates recording_versions.
     - Compares generation: if current generation != expected_generation, raises StaleVersionError (CAS failure).
     - Increments generation by 1.
+    - Fencing: verifies target ingestion version exists and has status 'staged'.
+    - Conditionally transitions target version to 'active'. If rowcount != 1, raises StaleVersionError.
     - Marks previous active version as 'superseded' in ingestion_versions.
-    - Marks new version as 'active' in ingestion_versions.
+    - Any failure rolls back both table updates atomically.
+    - Never uses INSERT OR REPLACE to reactivate an existing failed or superseded version.
 
     Returns:
         int: The new generation integer.
 
     Raises:
-        StaleVersionError: If concurrent activation altered the generation in the interim.
+        StaleVersionError: If concurrent activation altered generation or target version is not staged.
         RegistryUnavailableError: If SQLite write fails.
     """
     clean_rec_id = str(recording_id).strip()
@@ -446,6 +443,31 @@ def activate_version(
                         f"A newer ingestion has already been activated; rejecting stale activation of version '{clean_version}'."
                     )
                 new_gen = current_gen + 1
+            else:
+                # First versioned ingestion for this recording
+                if expected_generation != 0:
+                    raise StaleVersionError(
+                        f"Expected generation {expected_generation} for recording '{clean_rec_id}', but no record exists."
+                    )
+                new_gen = 1
+
+            # 1. Activation fencing: Verify target version is 'staged' and update to 'active'
+            ingest_cursor = conn.execute(
+                """
+                UPDATE ingestion_versions
+                SET status = 'active', generation = ?, updated_at = ?, activated_at = ?
+                WHERE recording_id = ? AND version = ? AND status = 'staged';
+                """,
+                (new_gen, now, now, clean_rec_id, clean_version),
+            )
+            if ingest_cursor.rowcount != 1:
+                raise StaleVersionError(
+                    f"Cannot activate version '{clean_version}' for recording '{clean_rec_id}': "
+                    f"version is not in staged status (lease expired or version marked failed)."
+                )
+
+            # 2. Update recording_versions with generation CAS check
+            if existing is not None:
                 cursor = conn.execute(
                     """
                     UPDATE recording_versions
@@ -459,22 +481,16 @@ def activate_version(
                         f"Failed compare-and-swap update for recording '{clean_rec_id}' (generation changed concurrently)."
                     )
 
-                # Mark prior active version as superseded
+                # Mark prior active version as superseded (excluding newly activated clean_version)
                 conn.execute(
                     """
                     UPDATE ingestion_versions
                     SET status = 'superseded', updated_at = ?
-                    WHERE recording_id = ? AND status = 'active';
+                    WHERE recording_id = ? AND status = 'active' AND version != ?;
                     """,
-                    (now, clean_rec_id),
+                    (now, clean_rec_id, clean_version),
                 )
             else:
-                # First versioned ingestion for this recording
-                if expected_generation != 0:
-                    raise StaleVersionError(
-                        f"Expected generation {expected_generation} for recording '{clean_rec_id}', but no record exists."
-                    )
-                new_gen = 1
                 conn.execute(
                     """
                     INSERT INTO recording_versions
@@ -483,16 +499,6 @@ def activate_version(
                     """,
                     (clean_rec_id, clean_version, now, now),
                 )
-
-            # Mark the new version as active
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO ingestion_versions
-                (recording_id, version, status, generation, created_at, updated_at, activated_at)
-                VALUES (?, ?, 'active', ?, ?, ?, ?);
-                """,
-                (clean_rec_id, clean_version, new_gen, now, now, now),
-            )
 
             conn.execute("COMMIT;")
             logger.info(
@@ -577,11 +583,15 @@ def recover_stale_staged_versions(
 
     Rules:
     1. Scoped to a specific recording_id if provided (acquires recording lock).
-    2. Only inspects versions where status = 'staged'.
-    3. Checks the heartbeat lease: (now - COALESCE(updated_at, created_at)) > timeout_seconds.
-    4. Re-checks the status during the atomic update.
-    5. NEVER touches 'active' or 'superseded' versions.
-    6. Returns list of recovered version IDs.
+    2. When recording_id is None (global recovery), queries candidate staged versions,
+       acquires acquire_recording_lock(candidate_recording_id) individually for each candidate,
+       rechecks version status and heartbeat cutoff inside the lock, and executes the
+       conditional transition inside a short SQLite transaction.
+    3. Only inspects versions where status = 'staged'.
+    4. Checks the heartbeat lease: (now - COALESCE(updated_at, created_at)) > timeout_seconds.
+    5. Re-checks the status during the atomic update.
+    6. NEVER touches 'active' or 'superseded' versions.
+    7. Returns list of recovered version IDs.
 
     Args:
         recording_id (Optional[str]): Optional recording ID to scope recovery.
@@ -592,16 +602,16 @@ def recover_stale_staged_versions(
         List[str]: List of version IDs transitioned from 'staged' to 'failed'.
     """
     clean_rec_id = recording_id.strip() if recording_id and isinstance(recording_id, str) else None
-    now = time.time()
-    cutoff_time = now - max(timeout_seconds, 1.0)
+    effective_timeout = max(timeout_seconds, 1.0)
 
-    def _do_recovery() -> List[str]:
-        recovered_versions: List[str] = []
-        with get_db_connection(db_path) as conn:
-            conn.execute("BEGIN IMMEDIATE;")
-            try:
-                # Find candidate staged versions older than the heartbeat cutoff
-                if clean_rec_id:
+    if clean_rec_id:
+        with acquire_recording_lock(clean_rec_id):
+            recovered_versions: List[str] = []
+            now = time.time()
+            cutoff_time = now - effective_timeout
+            with get_db_connection(db_path) as conn:
+                conn.execute("BEGIN IMMEDIATE;")
+                try:
                     cursor = conn.execute(
                         """
                         SELECT version, COALESCE(updated_at, created_at) as last_seen
@@ -610,49 +620,99 @@ def recover_stale_staged_versions(
                         """,
                         (clean_rec_id,),
                     )
-                else:
-                    cursor = conn.execute(
-                        """
-                        SELECT recording_id, version, COALESCE(updated_at, created_at) as last_seen
-                        FROM ingestion_versions
-                        WHERE status = 'staged';
-                        """
-                    )
-                candidates = cursor.fetchall()
-
-                for cand in candidates:
-                    v_id = str(cand["version"])
-                    r_id = clean_rec_id or str(cand["recording_id"])
-                    last_seen = float(cand["last_seen"]) if cand["last_seen"] else 0.0
-
-                    if last_seen < cutoff_time:
-                        update_cursor = conn.execute(
-                            """
-                            UPDATE ingestion_versions
-                            SET status = 'failed', updated_at = ?
-                            WHERE recording_id = ? AND version = ? AND status = 'staged'
-                              AND COALESCE(updated_at, created_at) <= ?;
-                            """,
-                            (now, r_id, v_id, cutoff_time),
-                        )
-                        if update_cursor.rowcount > 0:
-                            recovered_versions.append(v_id)
-                            logger.info(
-                                "Recovered abandoned staged version '%s' for recording '%s' (idle %.1fs).",
-                                v_id,
-                                r_id,
-                                now - last_seen,
+                    candidates = cursor.fetchall()
+                    for cand in candidates:
+                        v_id = str(cand["version"])
+                        last_seen = float(cand["last_seen"]) if cand["last_seen"] is not None else 0.0
+                        if last_seen <= cutoff_time:
+                            update_cursor = conn.execute(
+                                """
+                                UPDATE ingestion_versions
+                                SET status = 'failed', updated_at = ?
+                                WHERE recording_id = ? AND version = ? AND status = 'staged'
+                                  AND COALESCE(updated_at, created_at) <= ?;
+                                """,
+                                (now, clean_rec_id, v_id, cutoff_time),
                             )
+                            if update_cursor.rowcount > 0:
+                                recovered_versions.append(v_id)
+                                logger.info(
+                                    "Recovered abandoned staged version '%s' for recording '%s' (idle %.1fs).",
+                                    v_id,
+                                    clean_rec_id,
+                                    now - last_seen,
+                                )
+                    conn.execute("COMMIT;")
+                except Exception:
+                    conn.execute("ROLLBACK;")
+                    raise
+            return recovered_versions
+    else:
+        # Global recovery: query candidates first without holding write transactions
+        now = time.time()
+        cutoff_time = now - effective_timeout
+        candidate_items: List[tuple[str, str]] = []
+        with get_db_connection(db_path) as conn:
+            cursor = conn.execute(
+                """
+                SELECT recording_id, version
+                FROM ingestion_versions
+                WHERE status = 'staged' AND COALESCE(updated_at, created_at) <= ?;
+                """,
+                (cutoff_time,),
+            )
+            for row in cursor.fetchall():
+                candidate_items.append((str(row["recording_id"]), str(row["version"])))
 
-                conn.execute("COMMIT;")
-            except Exception:
-                conn.execute("ROLLBACK;")
-                raise
+        recovered_versions: List[str] = []
+        for cand_rec_id, cand_version in candidate_items:
+            try:
+                with acquire_recording_lock(cand_rec_id):
+                    cand_now = time.time()
+                    cand_cutoff = cand_now - effective_timeout
+                    with get_db_connection(db_path) as conn:
+                        conn.execute("BEGIN IMMEDIATE;")
+                        try:
+                            # Recheck status and cutoff inside lock
+                            check_cursor = conn.execute(
+                                """
+                                SELECT COALESCE(updated_at, created_at) as last_seen
+                                FROM ingestion_versions
+                                WHERE recording_id = ? AND version = ? AND status = 'staged';
+                                """,
+                                (cand_rec_id, cand_version),
+                            )
+                            row = check_cursor.fetchone()
+                            if row is not None:
+                                last_seen = float(row["last_seen"]) if row["last_seen"] is not None else 0.0
+                                if last_seen <= cand_cutoff:
+                                    update_cursor = conn.execute(
+                                        """
+                                        UPDATE ingestion_versions
+                                        SET status = 'failed', updated_at = ?
+                                        WHERE recording_id = ? AND version = ? AND status = 'staged'
+                                          AND COALESCE(updated_at, created_at) <= ?;
+                                        """,
+                                        (cand_now, cand_rec_id, cand_version, cand_cutoff),
+                                    )
+                                    if update_cursor.rowcount > 0:
+                                        recovered_versions.append(cand_version)
+                                        logger.info(
+                                            "Global recovery: recovered abandoned staged version '%s' for recording '%s' (idle %.1fs).",
+                                            cand_version,
+                                            cand_rec_id,
+                                            cand_now - last_seen,
+                                        )
+                            conn.execute("COMMIT;")
+                        except Exception:
+                            conn.execute("ROLLBACK;")
+                            raise
+            except TimeoutError:
+                logger.warning(
+                    "Global recovery skipped recording '%s' version '%s': could not acquire recording lock.",
+                    cand_rec_id,
+                    cand_version,
+                )
+                continue
 
         return recovered_versions
-
-    if clean_rec_id:
-        with acquire_recording_lock(clean_rec_id):
-            return _do_recovery()
-    else:
-        return _do_recovery()
