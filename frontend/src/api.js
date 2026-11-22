@@ -3,7 +3,19 @@
  * Connects to the FastAPI backend without exposing any credentials or secrets.
  */
 
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '');
+function getApiBaseUrl() {
+  const envUrl = import.meta.env.VITE_API_BASE_URL;
+  if (typeof window !== 'undefined' && window.location && window.location.hostname) {
+    const host = window.location.hostname;
+    // When accessing via LAN IP (e.g. 192.168.x.x), dynamically align API host with frontend host
+    if (host !== 'localhost' && host !== '127.0.0.1') {
+      return `http://${host}:8000`;
+    }
+  }
+  return (envUrl || 'http://localhost:8000').replace(/\/+$/, '');
+}
+
+const API_BASE_URL = getApiBaseUrl();
 
 export { API_BASE_URL };
 
