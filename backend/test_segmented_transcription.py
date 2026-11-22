@@ -700,5 +700,227 @@ class TestTranscribeSegmentedAudio(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+class TestSubSegmentConsistencyFix(unittest.TestCase):
+    """
+    Phase 3.3 regression tests for the sub-segment boundary dedup fix.
+
+    Previously, when word-level timestamps were present, sub-segments were
+    included unconditionally. This caused overlap-region sub-segments to appear
+    in BOTH adjacent audio-segment lists, resulting in duplicate text reaching
+    chunk_transcript(). The fix applies the boundary filter to sub-segments
+    unconditionally, regardless of whether word timestamps are present.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp()
+
+    # -----------------------------------------------------------------------
+    # test_21 — sub-segment starting before boundary is included from seg 0
+    # -----------------------------------------------------------------------
+    @patch("app.services.transcription_service.transcribe_audio")
+    def test_sub_segment_before_boundary_included(self, mock_ta: MagicMock) -> None:
+        """Sub-segment with translated start=598s < boundary=600s is included from seg 0."""
+        paths = [_make_segment_file(self.tmp, f"s{i}.wav") for i in range(2)]
+        mock_ta.side_effect = [
+            {
+                "text": "early content",
+                "segments": [
+                    # local 598.0 → global 598.0 < boundary 600.0 → MUST be included
+                    {"id": 0, "start": 598.0, "end": 599.5, "text": "early content"},
+                ],
+                "words": [{"word": "early", "start": 598.0, "end": 598.8},
+                           {"word": "content", "start": 598.8, "end": 599.5}],
+            },
+            {
+                "text": "next",
+                "segments": [{"id": 0, "start": 0.0, "end": 3.0, "text": "next"}],
+                "words": [{"word": "next", "start": 0.0, "end": 3.0}],
+            },
+        ]
+        segs = [(paths[0], 0.0, 604.0), (paths[1], 600.0, 900.0)]
+        result = transcribe_segmented_audio(segs)
+
+        texts = [s["text"] for s in result["segments"]]
+        self.assertIn("early content", texts)
+
+    # -----------------------------------------------------------------------
+    # test_22 — sub-segment at boundary=600s excluded from seg 0, present in seg 1
+    # -----------------------------------------------------------------------
+    @patch("app.services.transcription_service.transcribe_audio")
+    def test_sub_segment_at_boundary_excluded_from_seg0(self, mock_ta: MagicMock) -> None:
+        """Sub-segment starting at exactly boundary (600s) excluded from seg 0 and owned by seg 1."""
+        paths = [_make_segment_file(self.tmp, f"s{i}.wav") for i in range(2)]
+        mock_ta.side_effect = [
+            {
+                "text": "overlap text",
+                "segments": [
+                    # local 600.0 → global 600.0 == boundary 600.0 → MUST be excluded from seg 0
+                    {"id": 0, "start": 600.0, "end": 602.0, "text": "overlap text"},
+                ],
+                "words": [{"word": "overlap", "start": 600.0, "end": 601.0},
+                           {"word": "text", "start": 601.0, "end": 602.0}],
+            },
+            {
+                "text": "overlap text continued",
+                "segments": [
+                    # seg 1 owns from 600.0 onward (last seg, no boundary)
+                    {"id": 0, "start": 0.0, "end": 2.0, "text": "overlap text"},
+                    {"id": 1, "start": 2.0, "end": 5.0, "text": "continued"},
+                ],
+                "words": [{"word": "overlap", "start": 0.0, "end": 1.0},
+                           {"word": "text", "start": 1.0, "end": 2.0},
+                           {"word": "continued", "start": 2.0, "end": 5.0}],
+            },
+        ]
+        segs = [(paths[0], 0.0, 604.0), (paths[1], 600.0, 900.0)]
+        result = transcribe_segmented_audio(segs)
+
+        texts = [s["text"] for s in result["segments"]]
+        # "overlap text" should appear exactly once: from seg 1 (last segment, no boundary)
+        # It should NOT appear from seg 0 (its start 600.0 >= boundary 600.0)
+        overlap_count = texts.count("overlap text")
+        self.assertEqual(overlap_count, 1,
+                         f"Expected exactly 1 'overlap text' sub-segment, got {overlap_count}. "
+                         f"All texts: {texts}")
+        # "continued" from seg 1 (last) is always included
+        self.assertIn("continued", texts)
+
+    # -----------------------------------------------------------------------
+    # test_23 — sub-segment spanning boundary: start < boundary → included
+    # -----------------------------------------------------------------------
+    @patch("app.services.transcription_service.transcribe_audio")
+    def test_sub_segment_spanning_boundary_uses_start_time(self, mock_ta: MagicMock) -> None:
+        """Sub-segment starting at 599s (< 600s boundary), ending at 603s → included (start < boundary)."""
+        paths = [_make_segment_file(self.tmp, f"s{i}.wav") for i in range(2)]
+        mock_ta.side_effect = [
+            {
+                "text": "spanning",
+                "segments": [
+                    # local 599.0 → global 599.0 < boundary 600.0 → included
+                    {"id": 0, "start": 599.0, "end": 603.0, "text": "spanning"},
+                ],
+                "words": [{"word": "spanning", "start": 599.0, "end": 603.0}],
+            },
+            {
+                "text": "after",
+                "segments": [{"id": 0, "start": 3.0, "end": 6.0, "text": "after"}],
+                "words": [{"word": "after", "start": 3.0, "end": 6.0}],
+            },
+        ]
+        segs = [(paths[0], 0.0, 604.0), (paths[1], 600.0, 900.0)]
+        result = transcribe_segmented_audio(segs)
+
+        texts = [s["text"] for s in result["segments"]]
+        self.assertIn("spanning", texts,
+                      "Sub-segment starting before boundary must be included from seg 0.")
+        # Verify the spanning sub-segment's translated start
+        spanning_seg = next(s for s in result["segments"] if s["text"] == "spanning")
+        self.assertAlmostEqual(spanning_seg["start"], 599.0)
+
+    # -----------------------------------------------------------------------
+    # test_24 — overlap text appears exactly once (not duplicated)
+    # -----------------------------------------------------------------------
+    @patch("app.services.transcription_service.transcribe_audio")
+    def test_overlap_text_appears_exactly_once(self, mock_ta: MagicMock) -> None:
+        """Same overlap text in both audio segments after merge appears only once (from seg 1)."""
+        paths = [_make_segment_file(self.tmp, f"s{i}.wav") for i in range(2)]
+        # Boundary = 600.0
+        # Both audio segments have a sub-segment with text "repeated content" at different local times
+        # Seg 0: "repeated content" starts at local 600.5 → global 600.5 >= boundary → EXCLUDED from seg 0
+        # Seg 1: "repeated content" starts at local 0.5 → global 600.5 (last segment) → INCLUDED
+        mock_ta.side_effect = [
+            {
+                "text": "early repeated content",
+                "segments": [
+                    {"id": 0, "start": 595.0, "end": 599.0, "text": "early"},
+                    {"id": 1, "start": 600.5, "end": 604.0, "text": "repeated content"},  # >= boundary → excluded
+                ],
+                "words": [
+                    {"word": "early", "start": 595.0, "end": 599.0},
+                    {"word": "repeated", "start": 600.5, "end": 602.0},
+                    {"word": "content", "start": 602.0, "end": 604.0},
+                ],
+            },
+            {
+                "text": "repeated content and more",
+                "segments": [
+                    {"id": 0, "start": 0.5, "end": 4.0, "text": "repeated content"},  # last seg → included
+                    {"id": 1, "start": 4.0, "end": 8.0, "text": "and more"},
+                ],
+                "words": [
+                    {"word": "repeated", "start": 0.5, "end": 2.0},
+                    {"word": "content", "start": 2.0, "end": 4.0},
+                    {"word": "and", "start": 4.0, "end": 5.0},
+                    {"word": "more", "start": 5.0, "end": 8.0},
+                ],
+            },
+        ]
+        segs = [(paths[0], 0.0, 604.0), (paths[1], 600.0, 900.0)]
+        result = transcribe_segmented_audio(segs)
+
+        texts = [s["text"] for s in result["segments"]]
+        repeated_count = texts.count("repeated content")
+        self.assertEqual(repeated_count, 1,
+                         f"Expected exactly 1 'repeated content' sub-segment, got {repeated_count}. "
+                         f"All texts: {texts}")
+        self.assertIn("early", texts)
+        self.assertIn("and more", texts)
+
+    # -----------------------------------------------------------------------
+    # test_25 — merged text, segments, words all describe same content without duplicates
+    # -----------------------------------------------------------------------
+    @patch("app.services.transcription_service.transcribe_audio")
+    def test_merged_text_words_segments_consistent(self, mock_ta: MagicMock) -> None:
+        """After merge, text, segments, and words all describe the same content without duplicates."""
+        paths = [_make_segment_file(self.tmp, f"s{i}.wav") for i in range(2)]
+        # Boundary = 600.0
+        # Seg 0: "alpha" (local 0–5) + "beta" (local 600.5–603) — beta is in overlap region, excluded from seg 0
+        # Seg 1: "beta" (local 0.5–3) + "gamma" (local 3–6) — last segment, all included
+        mock_ta.side_effect = [
+            {
+                "text": "alpha beta",
+                "segments": [
+                    {"id": 0, "start": 0.0, "end": 5.0, "text": "alpha"},
+                    {"id": 1, "start": 600.5, "end": 603.0, "text": "beta"},  # >= boundary → excluded
+                ],
+                "words": [
+                    {"word": "alpha", "start": 0.0, "end": 5.0},
+                    {"word": "beta", "start": 600.5, "end": 603.0},  # >= boundary → excluded
+                ],
+            },
+            {
+                "text": "beta gamma",
+                "segments": [
+                    {"id": 0, "start": 0.5, "end": 3.0, "text": "beta"},   # last → included
+                    {"id": 1, "start": 3.0, "end": 6.0, "text": "gamma"},  # last → included
+                ],
+                "words": [
+                    {"word": "beta", "start": 0.5, "end": 3.0},    # last → included
+                    {"word": "gamma", "start": 3.0, "end": 6.0},   # last → included
+                ],
+            },
+        ]
+        segs = [(paths[0], 0.0, 604.0), (paths[1], 600.0, 900.0)]
+        result = transcribe_segmented_audio(segs)
+
+        # Segments should contain alpha, beta, gamma — each exactly once
+        seg_texts = [s["text"] for s in result["segments"]]
+        self.assertEqual(seg_texts.count("alpha"), 1)
+        self.assertEqual(seg_texts.count("beta"), 1)
+        self.assertEqual(seg_texts.count("gamma"), 1)
+
+        # Words should contain alpha, beta, gamma — each exactly once
+        word_texts = [w["word"] for w in result["words"]]
+        self.assertEqual(word_texts.count("alpha"), 1)
+        self.assertEqual(word_texts.count("beta"), 1)
+        self.assertEqual(word_texts.count("gamma"), 1)
+
+        # Merged text should contain all three words
+        merged_text = result["text"]
+        self.assertIn("alpha", merged_text)
+        self.assertIn("beta", merged_text)
+        self.assertIn("gamma", merged_text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

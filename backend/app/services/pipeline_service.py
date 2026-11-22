@@ -1,12 +1,18 @@
 import logging
 import math
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union
 
-from app.services.audio_service import extract_audio_from_video
+from app.services.audio_service import (
+    extract_audio_from_video,
+    get_media_duration,
+    split_audio_into_segments,
+)
 from app.services.chunking_service import chunk_transcript
 from app.services.embedding_service import embed_document
-from app.services.transcription_service import transcribe_audio
+from app.services.transcription_service import MAX_AUDIO_SIZE_BYTES  # 25 MB, Groq limit
+from app.services.transcription_service import transcribe_audio, transcribe_segmented_audio
 from app.services.vector_store_service import store_transcript_chunks
 
 # Configure module logger for server-side diagnostics
@@ -16,9 +22,6 @@ logger = logging.getLogger(__name__)
 VIDEO_EXTENSIONS: Set[str] = {".mp4"}
 AUDIO_EXTENSIONS: Set[str] = {".mp3", ".wav", ".m4a"}
 SUPPORTED_EXTENSIONS: Set[str] = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
-
-# Maximum audio size permitted by Groq Whisper Large v3 API
-MAX_AUDIO_SIZE_BYTES: int = 25 * 1024 * 1024  # 25 MB
 
 
 def validate_normalized_transcript(transcript: Dict[str, Any]) -> Dict[str, Any]:
@@ -227,6 +230,7 @@ def ingest_recording(
     try:
         transcription: Dict[str, Any]
         transcript_reused: bool = False
+        segmented_audio: bool = False
 
         # ---------------------------------------------------------
         # Stage A: Transcript Reuse OR Audio Extraction & Transcription
@@ -238,6 +242,22 @@ def ingest_recording(
             )
             transcription = validate_normalized_transcript(existing_transcript)
             transcript_reused = True
+            segments = transcription.get("segments") or []
+            if not segments:
+                raise ValueError(
+                    f"Transcription produced no segments for recording '{clean_recording_id}'."
+                )
+            # Duration from segment timestamps for reused transcripts
+            valid_ends = [
+                float(s["end"])
+                for s in segments
+                if isinstance(s, dict)
+                and not isinstance(s.get("end"), bool)
+                and isinstance(s.get("end"), (int, float))
+                and math.isfinite(s["end"])
+                and s["end"] >= 0.0
+            ]
+            duration: float = round(max(valid_ends), 2) if valid_ends else 0.0
         else:
             assert resolved_media_path is not None
             is_video = resolved_media_path.suffix.lower() in VIDEO_EXTENSIONS
@@ -264,51 +284,68 @@ def ingest_recording(
                 audio_path = resolved_media_path
                 is_extracted_audio = False
 
-            # Strict 25 MB Audio Size Check Before Transcription
+            # Stage 2: Transcription — single-file or segmented based on audio size
             audio_size_bytes = audio_path.stat().st_size
-            if audio_size_bytes > MAX_AUDIO_SIZE_BYTES:
+
+            if audio_size_bytes <= MAX_AUDIO_SIZE_BYTES:
+                # Stage 2a: Single-file transcription (Groq Whisper Large v3, ≤25 MB)
+                logger.info(
+                    "Stage 2/5: Transcribing audio '%s' (%.2f MB) via Groq Whisper Large v3 (single-file path)...",
+                    audio_path.name,
+                    audio_size_bytes / (1024 * 1024),
+                )
+                transcription = transcribe_audio(audio_path)
+                segmented_audio = False
+
+                # Derive duration from segment end timestamps (existing behavior for short audio)
+                segments = transcription.get("segments") or []
+                if not segments:
+                    raise ValueError(
+                        f"Transcription produced no segments for recording '{clean_recording_id}'."
+                    )
+                valid_ends = [
+                    float(s["end"])
+                    for s in segments
+                    if isinstance(s, dict)
+                    and not isinstance(s.get("end"), bool)
+                    and isinstance(s.get("end"), (int, float))
+                    and math.isfinite(s["end"])
+                    and s["end"] >= 0.0
+                ]
+                duration: float = round(max(valid_ends), 2) if valid_ends else 0.0
+
+            else:
+                # Stage 2b: Segmented transcription for long audio (>25 MB)
                 size_mb = audio_size_bytes / (1024 * 1024)
-                limit_mb = MAX_AUDIO_SIZE_BYTES / (1024 * 1024)
-                logger.error(
-                    "Audio file '%s' (%.2f MB) exceeds Groq limit of %.0f MB.",
+                logger.info(
+                    "Stage 2/5: Audio '%s' (%.2f MB) exceeds 25 MB limit — using segmented transcription path...",
                     audio_path.name,
                     size_mb,
-                    limit_mb,
                 )
-                raise ValueError(
-                    f"Audio file '{audio_path.name}' size ({size_mb:.2f} MB) exceeds "
-                    f"maximum allowed transcription limit of {limit_mb:.0f} MB."
-                )
+                with tempfile.TemporaryDirectory(prefix="echotrace_segments_") as seg_tmp_dir:
+                    segments_list = split_audio_into_segments(audio_path, seg_tmp_dir)
+                    logger.info(
+                        "Stage 2/5: Split into %d segment(s); transcribing via Groq Whisper Large v3 (segmented path)...",
+                        len(segments_list),
+                    )
+                    transcription = transcribe_segmented_audio(segments_list)
+                # TemporaryDirectory context manager cleans up segment files here
 
-            # Stage 2: Audio Transcription (Groq Whisper Large v3)
-            logger.info(
-                "Stage 2/5: Transcribing audio '%s' via Groq Whisper Large v3...",
-                audio_path.name,
-            )
-            transcription = transcribe_audio(audio_path)
+                segmented_audio = True
+                segments = transcription.get("segments") or []
+                if not segments:
+                    raise ValueError(
+                        f"Segmented transcription produced no segments for recording '{clean_recording_id}'."
+                    )
+
+                # Duration from FFprobe for long recordings (segment timestamps may not span full duration)
+                duration = round(get_media_duration(audio_path), 2)
+                logger.info(
+                    "Stage 2/5: Segmented transcription complete; FFprobe duration=%.2fs.",
+                    duration,
+                )
 
         segments = transcription.get("segments") or []
-        if not segments:
-            raise ValueError(
-                f"Transcription produced no segments for recording '{clean_recording_id}'."
-            )
-
-        # ---------------------------------------------------------
-        # Derive Duration and Language Safely
-        # ---------------------------------------------------------
-        # Safely derive duration from valid segment end timestamps
-        duration: float = 0.0
-        valid_ends = [
-            float(s["end"])
-            for s in segments
-            if isinstance(s, dict)
-            and not isinstance(s.get("end"), bool)
-            and isinstance(s.get("end"), (int, float))
-            and math.isfinite(s["end"])
-            and s["end"] >= 0.0
-        ]
-        if valid_ends:
-            duration = round(max(valid_ends), 2)
 
         # Language: keep "unknown" unless verified information is provided
         language: str = str(transcription.get("language") or "unknown")
@@ -397,6 +434,8 @@ def ingest_recording(
             "chunk_count": len(chunks),
             "stored_chunk_ids": stored_ids,
             "transcript_reused": transcript_reused,
+            "segmented_audio": segmented_audio,
+            "transcription_mode": "segmented" if segmented_audio else "single_file",
         }
 
         logger.info(

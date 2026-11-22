@@ -361,15 +361,11 @@ def transcribe_segmented_audio(
     - Transcribes segments sequentially using transcribe_audio().
     - Applies a global time offset to every segment and word timestamp so that all
       timestamps are expressed in terms of the original recording timeline.
-    - Deduplicates overlapping content at segment boundaries using word-level timestamps
-      when available. A word belongs to segment k if its translated start time is strictly
-      less than the global_start of segment k+1 (the nominal boundary). The final segment
-      owns all of its words unconditionally.
-    - Falls back to segment-level deduplication when a segment returns no word-level
-      timestamps. In this case, a translated segment is included if its translated start
-      time is strictly less than the nominal boundary. This is less precise than
-      word-level deduplication and may include or exclude a small number of boundary
-      words incorrectly.
+    - Deduplicates overlapping content at segment boundaries by boundary filtering.
+      Both words and sub-segments are always filtered by the nominal boundary: a word
+      or sub-segment belongs to audio segment k if its translated start time is strictly
+      less than the global_start of segment k+1. The final segment has no upper boundary
+      and owns all of its content unconditionally.
     - Retries transient failures (HTTP 429, 500, 502, 503, 504) with exponential backoff
       up to MAX_RETRIES total attempts. Permanent failures (HTTP 400, 404, 413, 422) are
       not retried.
@@ -400,9 +396,10 @@ def transcribe_segmented_audio(
         HTTPException: Propagated from transcribe_audio() after exhausting retries.
 
     Limitations:
-        - Segment-level fallback deduplication (when words are absent) may be slightly
-          imprecise at boundaries if a segment's text spans the boundary without word
-          timestamps.
+        - Sub-segment boundary filtering is based on the sub-segment's translated start
+          time. If a sub-segment's text spans the boundary, the whole sub-segment is
+          assigned to whichever side owns its start. This is consistent with word-level
+          deduplication behaviour.
         - Concurrent transcription is not supported; segments are processed sequentially.
     """
     # ----------------------------------------------------------------
@@ -611,13 +608,12 @@ def transcribe_segmented_audio(
                 )
                 continue
 
-            # Deduplication strategy:
-            #   - If word-level timestamps are available, include this sub-segment
-            #     unconditionally (word-level dedup handles precision).
-            #   - If no word-level timestamps, apply segment-level dedup:
-            #     include only if s_start < boundary.
-            if not has_words and boundary is not None and s_start >= boundary:
-                continue  # Segment-level fallback dedup
+            # Deduplication: apply boundary filter to sub-segments unconditionally.
+            # A sub-segment belongs to this audio segment if its translated start is
+            # strictly before the nominal boundary (global_start of the next segment).
+            # The final segment has no boundary and owns all its sub-segments.
+            if boundary is not None and s_start >= boundary:
+                continue
 
             merged_segments.append({
                 **s,
