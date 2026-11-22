@@ -102,6 +102,26 @@ export async function getRecordingTranscript(recordingId) {
 }
 
 /**
+ * Deletes a recording, its metadata, media files, and vector chunks.
+ */
+export async function deleteRecording(recordingId) {
+  const res = await fetch(`${API_BASE_URL}/media/${encodeURIComponent(recordingId)}`, {
+    method: 'DELETE',
+  });
+
+  if (!res.ok) {
+    let errDetail = 'Failed to delete recording';
+    try {
+      const errJson = await res.json();
+      errDetail = errJson.detail || errDetail;
+    } catch (_) {}
+    throw new Error(errDetail);
+  }
+
+  return await res.json();
+}
+
+/**
  * Returns the direct media streaming URL for audio/video playback with HTTP Range support.
  */
 export function getMediaStreamUrl(recordingId) {

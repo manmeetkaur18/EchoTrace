@@ -36,6 +36,87 @@ PROCESSED_DIR = BACKEND_DIR / "data" / "processed"
 SAFE_RECORDING_ID_REGEX = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 
+def sanitize_error_message(error: Union[Exception, str, None]) -> Optional[str]:
+    """
+    Sanitizes raw backend exceptions or error strings before returning them to clients or storing
+    them in user-facing metadata.
+
+    Protects against leaking:
+    - API keys and tokens (e.g. gsk_*, sk-*, AIzaSy*, etc.)
+    - Local filesystem paths (e.g. D:\\..., C:\\..., /home/..., /tmp/...)
+    - Internal database connection strings or passwords (e.g. DATABASE_PASSWORD=...)
+    - Stack traces, Python exception classes, and provider internal server codes
+
+    Preserves actionable, user-understandable diagnostic categories.
+    """
+    if error is None:
+        return None
+
+    raw = str(error).strip()
+    if not raw:
+        return "An unknown error occurred during recording processing."
+
+    raw_lower = raw.lower()
+
+    # 1. YouTube platform restriction
+    if "youtube" in raw_lower and ("restricted" in raw_lower or "scraping" in raw_lower or "authorized" in raw_lower):
+        return "YouTube downloading is restricted. Please save the audio/video file locally and upload it directly."
+
+    # 2. TED Talk platform restriction
+    if "ted" in raw_lower and ("restricted" in raw_lower or "licensing" in raw_lower or "terms" in raw_lower):
+        return "TED Talk ingestion is restricted by licensing terms. Please upload an authorized audio/video file directly."
+
+    # 3. SSRF / Private network blocking
+    if "restricted" in raw_lower and ("ip address" in raw_lower or "private" in raw_lower or "internal" in raw_lower or "ssrf" in raw_lower):
+        return "The provided URL resolves to a restricted or private network address and cannot be accessed."
+
+    # 4. File size limits
+    if "exceed" in raw_lower and ("size" in raw_lower or "limit" in raw_lower or "mb" in raw_lower or "bytes" in raw_lower):
+        return "The media file exceeds the maximum allowed file size limit."
+
+    # 5. Empty media
+    if "empty (0 bytes)" in raw_lower or "is empty" in raw_lower or "empty file" in raw_lower:
+        return "The provided media file is empty (0 bytes)."
+
+    # 6. Unsupported / corrupted media format
+    if "unsupported" in raw_lower or "signature is invalid" in raw_lower or "magic bytes" in raw_lower or "mismatched media" in raw_lower:
+        return "The media file format is unsupported or corrupted. Supported formats are MP4, MP3, WAV, M4A."
+
+    # 7. Audio processing / segmentation / duration
+    if "duration" in raw_lower and ("zero" in raw_lower or "negative" in raw_lower or "non-finite" in raw_lower or "invalid" in raw_lower):
+        return "The media file contains invalid or unreadable audio duration."
+    if "segmentation" in raw_lower or "ffmpeg" in raw_lower or "ffprobe" in raw_lower or "audio extraction" in raw_lower:
+        return "Audio extraction or segmentation failed. The media file may be corrupted or unreadable."
+
+    # 8. Transcription service failures
+    if "whisper" in raw_lower or "groq" in raw_lower or "transcription" in raw_lower:
+        return "Speech transcription failed. Please check your transcription service or try again later."
+
+    # 9. Embedding / ChromaDB / Vector Store
+    if "chroma" in raw_lower or "embedding" in raw_lower or "gemini" in raw_lower or "vector" in raw_lower:
+        return "Failed to generate embeddings or index recording into the vector database."
+
+    # 10. General sanitized fallback: strip sensitive patterns
+    sanitized = raw
+
+    # Strip API keys
+    sanitized = re.sub(r"\b(gsk_|sk-|AIzaSy)[a-zA-Z0-9_\-]{8,}\b", "[REDACTED_API_KEY]", sanitized)
+    # Strip database credentials / passwords
+    sanitized = re.sub(r"(?i)(password|secret|token|api_key)\s*=\s*[^\s;,]+", r"\1=[REDACTED]", sanitized)
+    # Strip Windows & Unix filesystem paths
+    sanitized = re.sub(r"[A-Za-z]:\\[a-zA-Z0-9_\-\.\\]+", "[PATH]", sanitized)
+    sanitized = re.sub(r"(?:/[a-zA-Z0-9_\-\.]+){2,}", "[PATH]", sanitized)
+
+    # If the message still looks like an unhandled traceback or internal exception
+    if any(term in sanitized.lower() for term in ["traceback", "syntaxerror", "connection refused", "internal-db"]):
+        return "An unexpected server error occurred during processing."
+
+    if len(sanitized) > 200:
+        sanitized = sanitized[:197] + "..."
+
+    return sanitized
+
+
 def validate_recording_id(recording_id: str) -> str:
     """
     Validates that a recording ID consists strictly of alphanumeric characters,
@@ -126,6 +207,7 @@ def upsert_recording_meta(
     clean_id = validate_recording_id(recording_id)
     init_recordings_table(db_path)
     now = time.time()
+    clean_err = sanitize_error_message(error_message) if error_message is not None else None
 
     with get_db_connection(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE;")
@@ -160,7 +242,7 @@ def upsert_recording_meta(
                         st,
                         duration_seconds,
                         chunk_count or 0,
-                        error_message,
+                        clean_err,
                         now,
                         now,
                     ),
@@ -192,7 +274,7 @@ def upsert_recording_meta(
                     params.append(chunk_count)
                 if error_message is not None:
                     updates.append("error_message = ?")
-                    params.append(error_message)
+                    params.append(clean_err)
 
                 params.append(clean_id)
                 conn.execute(
@@ -347,6 +429,109 @@ def get_recording_transcript_chunks(
     # Sort chunks chronologically
     chunks.sort(key=lambda c: (c["start"], c["end"], c["chunk_index"]))
     return chunks
+
+
+def delete_recording_data(
+    recording_id: str,
+    db_path: Optional[Union[str, Path]] = None,
+    collection: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Safely and idempotently removes a recording and all its associated artifacts:
+    1. Validates recording_id to defend against path traversal.
+    2. Checks recording status; aborts if currently 'processing'.
+    3. Prunes ChromaDB vector embeddings scoped strictly to this recording_id.
+    4. Removes SQLite metadata and version records (recordings_meta, recording_versions, ingestion_versions).
+    5. Removes uploaded and processed media files belonging to the recording.
+    """
+    from app.services.registry_service import acquire_recording_lock, get_db_connection
+    from app.services.vector_store_service import get_vector_collection
+
+    clean_id = validate_recording_id(recording_id)
+    init_recordings_table(db_path)
+
+    # 1. Acquire recording lock to prevent race conditions with ongoing operations
+    with acquire_recording_lock(clean_id):
+        # 2. Check metadata
+        meta = get_recording_meta(clean_id, db_path=db_path)
+        if meta and meta.get("status") == "processing":
+            raise ValueError(f"Cannot delete recording '{clean_id}' while it is actively processing.")
+
+        # 3. Clean up ChromaDB vectors for this recording
+        try:
+            target_col = collection if collection is not None else get_vector_collection()
+            existing_chunks = target_col.get(where={"recording_id": clean_id})
+            chunk_ids = existing_chunks.get("ids", []) if existing_chunks else []
+            if chunk_ids:
+                logger.info("Deleting %d vector chunk(s) for recording '%s'...", len(chunk_ids), clean_id)
+                target_col.delete(ids=chunk_ids)
+        except Exception as chroma_err:
+            logger.warning("Error pruning ChromaDB vectors for recording '%s': %s", clean_id, chroma_err)
+
+        # 4. Clean up SQLite metadata and registry tables
+        with get_db_connection(db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                existing_tables = {row["name"] for row in cursor.fetchall()}
+
+                if "recordings_meta" in existing_tables:
+                    conn.execute("DELETE FROM recordings_meta WHERE recording_id = ?;", (clean_id,))
+                if "recording_versions" in existing_tables:
+                    conn.execute("DELETE FROM recording_versions WHERE recording_id = ?;", (clean_id,))
+                if "ingestion_versions" in existing_tables:
+                    conn.execute("DELETE FROM ingestion_versions WHERE recording_id = ?;", (clean_id,))
+                conn.execute("COMMIT;")
+                logger.info("Deleted SQLite records for recording '%s'.", clean_id)
+            except Exception as db_err:
+                conn.execute("ROLLBACK;")
+                logger.error("Failed to delete SQLite records for recording '%s': %s", clean_id, db_err)
+                raise
+
+        # 5. Clean up media and temporary files strictly scoped to this recording_id
+        removed_files: List[str] = []
+
+        # Check UPLOAD_DIR
+        if UPLOAD_DIR.is_dir():
+            upload_dir_resolved = UPLOAD_DIR.resolve()
+            for ext in ALLOWED_EXTENSIONS | {".media", ".bin"}:
+                for prefix in (clean_id, f"tmp_{clean_id}"):
+                    candidate = (UPLOAD_DIR / f"{prefix}{ext}").resolve()
+                    if candidate.is_file() and upload_dir_resolved in candidate.parents:
+                        try:
+                            candidate.unlink()
+                            removed_files.append(candidate.name)
+                        except Exception as unlink_err:
+                            logger.warning("Failed to unlink '%s': %s", candidate, unlink_err)
+
+        # Check PROCESSED_DIR
+        if PROCESSED_DIR.is_dir():
+            proc_dir_resolved = PROCESSED_DIR.resolve()
+            # Direct extracted audio file
+            candidate_wav = (PROCESSED_DIR / f"{clean_id}.wav").resolve()
+            if candidate_wav.is_file() and proc_dir_resolved in candidate_wav.parents:
+                try:
+                    candidate_wav.unlink()
+                    removed_files.append(candidate_wav.name)
+                except Exception as unlink_err:
+                    logger.warning("Failed to unlink '%s': %s", candidate_wav, unlink_err)
+
+            # Segmented files if any
+            for seg_file in PROCESSED_DIR.glob(f"{clean_id}_seg_*.wav"):
+                seg_resolved = seg_file.resolve()
+                if seg_resolved.is_file() and proc_dir_resolved in seg_resolved.parents:
+                    try:
+                        seg_resolved.unlink()
+                        removed_files.append(seg_resolved.name)
+                    except Exception as unlink_err:
+                        logger.warning("Failed to unlink segment '%s': %s", seg_resolved, unlink_err)
+
+        return {
+            "success": True,
+            "recording_id": clean_id,
+            "message": f"Recording '{clean_id}' successfully deleted.",
+            "removed_files": removed_files,
+        }
 
 
 async def save_uploaded_media(file: UploadFile) -> Dict[str, Any]:

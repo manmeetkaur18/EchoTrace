@@ -10,6 +10,7 @@ import {
   listRecordings,
   getRecordingStatus,
   getRecordingTranscript,
+  deleteRecording,
 } from './api';
 
 export default function App() {
@@ -22,6 +23,7 @@ export default function App() {
   const [currentTime, setCurrentTime] = useState(0);
   const [targetSeekTime, setTargetSeekTime] = useState(null);
   const [isUploadOpen, setIsUploadOpen] = useState(false);
+  const [deleteError, setDeleteError] = useState(null);
 
   const playerRef = useRef(null);
 
@@ -134,6 +136,24 @@ export default function App() {
     setActiveRecordingId(newRecordingId);
   };
 
+  // 6. Handle recording deletion
+  const handleDeleteRecording = async (recordingId) => {
+    setDeleteError(null);
+    try {
+      await deleteRecording(recordingId);
+      if (activeRecordingId === recordingId) {
+        setActiveRecordingId(null);
+        setActiveRecording(null);
+        setTranscriptChunks([]);
+        setTargetSeekTime(null);
+      }
+      await refreshRecordings();
+    } catch (err) {
+      console.error('Delete recording error:', err);
+      setDeleteError(err.message || 'Failed to delete recording.');
+    }
+  };
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh', background: 'var(--bg-primary)' }}>
       {/* Top Navbar */}
@@ -158,6 +178,7 @@ export default function App() {
             setActiveRecordingId(id);
             setTargetSeekTime(null);
           }}
+          onDeleteRecording={handleDeleteRecording}
           onRefresh={refreshRecordings}
         />
 
@@ -170,6 +191,30 @@ export default function App() {
           overflowY: 'auto',
           minWidth: 0,
         }}>
+          {/* Deletion Error Feedback Banner */}
+          {deleteError && (
+            <div style={{
+              padding: '12px 18px',
+              borderRadius: 'var(--radius-md)',
+              background: 'rgba(244, 63, 94, 0.15)',
+              border: '1px solid rgba(244, 63, 94, 0.4)',
+              color: '#fda4af',
+              fontSize: '0.85rem',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+            }}>
+              <span>⚠️ {deleteError}</span>
+              <button
+                className="btn btn-ghost"
+                style={{ padding: '2px 8px', fontSize: '0.8rem' }}
+                onClick={() => setDeleteError(null)}
+              >
+                ✕
+              </button>
+            </div>
+          )}
+
           {/* Status Alert Banner if processing or failed */}
           {activeRecording && activeRecording.status === 'processing' && (
             <div style={{
@@ -204,21 +249,41 @@ export default function App() {
               border: '1px solid rgba(244, 63, 94, 0.35)',
               display: 'flex',
               alignItems: 'center',
+              justifyContent: 'space-between',
               gap: '12px',
             }}>
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#f43f5e" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <circle cx="12" cy="12" r="10" />
-                <line x1="12" y1="8" x2="12" y2="12" />
-                <line x1="12" y1="16" x2="12.01" y2="16" />
-              </svg>
-              <div>
-                <p style={{ fontWeight: '600', color: '#fda4af', fontSize: '0.9rem' }}>
-                  Ingestion Failed for {activeRecording.original_filename}
-                </p>
-                <p style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
-                  {activeRecording.error_message || 'An error occurred during transcription or storage.'}
-                </p>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#f43f5e" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+                  <circle cx="12" cy="12" r="10" />
+                  <line x1="12" y1="8" x2="12" y2="12" />
+                  <line x1="12" y1="16" x2="12.01" y2="16" />
+                </svg>
+                <div>
+                  <p style={{ fontWeight: '600', color: '#fda4af', fontSize: '0.9rem', marginBottom: '2px' }}>
+                    Ingestion Failed for {activeRecording.original_filename}
+                  </p>
+                  <p style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
+                    {activeRecording.error_message || 'An error occurred during transcription or storage.'}
+                  </p>
+                </div>
               </div>
+              <button
+                className="btn btn-secondary"
+                style={{
+                  fontSize: '0.78rem',
+                  padding: '6px 12px',
+                  color: '#f43f5e',
+                  borderColor: 'rgba(244, 63, 94, 0.4)',
+                  flexShrink: 0,
+                }}
+                onClick={() => {
+                  if (window.confirm(`Delete failed recording "${activeRecording.original_filename}"?`)) {
+                    handleDeleteRecording(activeRecording.recording_id);
+                  }
+                }}
+              >
+                Delete Recording
+              </button>
             </div>
           )}
 

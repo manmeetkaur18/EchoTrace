@@ -1,6 +1,27 @@
 import React, { useState, useRef } from 'react';
 import { uploadMediaFile, ingestMediaUrl } from '../api';
 
+export function isRestrictedPlatformUrl(urlString) {
+  if (!urlString || typeof urlString !== 'string') return false;
+  const trimmed = urlString.trim();
+  if (!trimmed) return false;
+  try {
+    const normalized = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase();
+
+    // Recognize legitimate YouTube hostnames (e.g. youtube.com, www.youtube.com, m.youtube.com, youtu.be)
+    const isYouTube = host === 'youtube.com' || host.endsWith('.youtube.com') || host === 'youtu.be' || host.endsWith('.youtu.be');
+
+    // Recognize legitimate TED hostnames (e.g. ted.com, www.ted.com)
+    const isTed = host === 'ted.com' || host.endsWith('.ted.com');
+
+    return isYouTube || isTed;
+  } catch (_) {
+    return false;
+  }
+}
+
 export default function UploadModal({ isOpen, onClose, onUploadSuccess }) {
   const [activeTab, setActiveTab] = useState('file'); // 'file' | 'url'
   const [file, setFile] = useState(null);
@@ -10,7 +31,7 @@ export default function UploadModal({ isOpen, onClose, onUploadSuccess }) {
   const [error, setError] = useState(null);
   const fileInputRef = useRef(null);
 
-  const isYouTubeOrTed = /(?:youtube\.com|youtu\.be|ted\.com)/i.test(url.trim());
+  const isYouTubeOrTed = isRestrictedPlatformUrl(url);
 
   if (!isOpen) return null;
 

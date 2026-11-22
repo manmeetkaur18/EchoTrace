@@ -4,13 +4,16 @@ from typing import Any, Dict, List, Optional, Union
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from app.services.media_service import (
     ALLOWED_EXTENSIONS,
+    delete_recording_data,
     get_media_file_path,
     get_recording_meta,
     get_recording_transcript_chunks,
     list_recordings_meta,
+    sanitize_error_message,
     save_uploaded_media,
     upsert_recording_meta,
     validate_recording_id,
@@ -104,10 +107,11 @@ def run_ingestion_background(recording_id: str, file_path: Union[str, Path]) -> 
         logger.info("Background ingestion succeeded for recording '%s'.", recording_id)
     except Exception as exc:
         logger.error("Background ingestion failed for recording '%s': %s", recording_id, exc, exc_info=True)
+        safe_msg = sanitize_error_message(exc)
         upsert_recording_meta(
             recording_id=recording_id,
             status="failed",
-            error_message=str(exc),
+            error_message=safe_msg,
         )
 
 
@@ -128,19 +132,33 @@ def run_url_ingestion_background(
             recording_id=recording_id,
             requested_episode=requested_episode,
         )
+
+        # Phase 1, Issue 4: Determine media type accurately from downloaded media & pipeline outcome
+        detected_media_type = outcome.get("media_type")
+        final_file = get_media_file_path(recording_id)
+        saved_fn = final_file.name if final_file else f"{recording_id}.media"
+        file_sz = final_file.stat().st_size if final_file and final_file.is_file() else 0
+
+        if not detected_media_type or detected_media_type not in ("video", "audio"):
+            detected_media_type = "video" if saved_fn.lower().endswith(".mp4") else "audio"
+
         upsert_recording_meta(
             recording_id=recording_id,
+            saved_filename=saved_fn,
+            media_type=detected_media_type,
+            file_size=file_sz,
             status="ready",
             duration_seconds=outcome.get("duration_seconds"),
             chunk_count=outcome.get("chunk_count", 0),
         )
-        logger.info("URL ingestion succeeded for recording '%s'.", recording_id)
+        logger.info("URL ingestion succeeded for recording '%s' (media_type=%s).", recording_id, detected_media_type)
     except Exception as exc:
         logger.error("URL ingestion failed for recording '%s': %s", recording_id, exc, exc_info=True)
+        safe_msg = sanitize_error_message(exc)
         upsert_recording_meta(
             recording_id=recording_id,
             status="failed",
-            error_message=str(exc),
+            error_message=safe_msg,
         )
 
 
@@ -155,8 +173,8 @@ def run_url_ingestion_background(
     description="Uploads media file, saves it securely, and starts ingestion pipeline.",
 )
 async def upload_media(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = BackgroundTasks(),
     async_process: bool = Query(True, description="Process ingestion asynchronously in background."),
 ) -> MediaUploadResponse:
     """
@@ -177,11 +195,11 @@ async def upload_media(
         status="processing",
     )
 
-    # 3. Trigger ingestion
+    # 3. Trigger ingestion (async via BackgroundTasks, or offload synchronous work to threadpool)
     if async_process:
         background_tasks.add_task(run_ingestion_background, recording_id, saved_media["file_path"])
     else:
-        run_ingestion_background(recording_id, saved_media["file_path"])
+        await run_in_threadpool(run_ingestion_background, recording_id, saved_media["file_path"])
 
     meta = get_recording_meta(recording_id)
     current_status = meta.get("status", "processing") if meta else "processing"
@@ -205,7 +223,7 @@ async def upload_media(
 )
 async def ingest_url_endpoint(
     payload: UrlIngestRequest,
-    background_tasks: BackgroundTasks = BackgroundTasks(),
+    background_tasks: BackgroundTasks,
     async_process: bool = Query(True),
 ) -> Dict[str, Any]:
     """
@@ -219,11 +237,14 @@ async def ingest_url_endpoint(
 
     rec_id = payload.recording_id.strip() if payload.recording_id else str(uuid.uuid4())
 
+    initial_media_type = "video" if clean_url.lower().endswith(".mp4") else "audio"
+    initial_saved_fn = f"{rec_id}.mp4" if initial_media_type == "video" else f"{rec_id}.media"
+
     upsert_recording_meta(
         recording_id=rec_id,
         original_filename=clean_url,
-        saved_filename=f"{rec_id}.media",
-        media_type="audio",
+        saved_filename=initial_saved_fn,
+        media_type=initial_media_type,
         file_size=0,
         status="processing",
     )
@@ -236,7 +257,8 @@ async def ingest_url_endpoint(
             payload.requested_episode,
         )
     else:
-        run_url_ingestion_background(
+        await run_in_threadpool(
+            run_url_ingestion_background,
             clean_url,
             rec_id,
             payload.requested_episode,
@@ -345,3 +367,55 @@ async def stream_media(recording_id: str) -> FileResponse:
         media_type=media_type,
         filename=file_path.name,
     )
+
+
+@router.delete(
+    "/{recording_id}",
+    summary="Delete a recording, its metadata, media files, and vector chunks",
+)
+async def delete_recording_endpoint(recording_id: str) -> Dict[str, Any]:
+    """
+    Deletes a failed (or completed) recording, removing its metadata from SQLite,
+    pruning its vectors from ChromaDB, and unlinking associated media files from disk.
+    Rejects deletion if recording is actively processing.
+    """
+    try:
+        clean_id = validate_recording_id(recording_id)
+    except ValueError as val_err:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(val_err),
+        )
+
+    meta = get_recording_meta(clean_id)
+    if not meta:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Recording '{clean_id}' not found.",
+        )
+
+    if meta.get("status") == "processing":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot delete recording '{clean_id}' while it is actively processing.",
+        )
+
+    try:
+        result = delete_recording_data(clean_id)
+        return result
+    except ValueError as val_err:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(val_err),
+        )
+    except KeyError as key_err:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(key_err),
+        )
+    except Exception as exc:
+        logger.error("Failed to delete recording '%s': %s", clean_id, exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete recording '{clean_id}'.",
+        )
