@@ -10,6 +10,8 @@ export default function UploadModal({ isOpen, onClose, onUploadSuccess }) {
   const [error, setError] = useState(null);
   const fileInputRef = useRef(null);
 
+  const isYouTubeOrTed = /(?:youtube\.com|youtu\.be|ted\.com)/i.test(url.trim());
+
   if (!isOpen) return null;
 
   const handleFileDrop = (e) => {
@@ -44,6 +46,9 @@ export default function UploadModal({ isOpen, onClose, onUploadSuccess }) {
       } else {
         if (!url.trim()) {
           throw new Error('Please enter a media URL or podcast RSS feed URL.');
+        }
+        if (isYouTubeOrTed) {
+          throw new Error('Direct YouTube and TED downloading is restricted by platform policy. Please save the media file locally and upload it using the "Upload File" tab.');
         }
         const res = await ingestMediaUrl(url.trim(), episodeFilter.trim() || null);
         onUploadSuccess(res.recording_id);
@@ -201,7 +206,24 @@ export default function UploadModal({ isOpen, onClose, onUploadSuccess }) {
                   onChange={(e) => setUrl(e.target.value)}
                   disabled={isSubmitting}
                 />
+                <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '4px' }}>
+                  Accepts direct media files (.mp3, .wav, .m4a, .mp4) or podcast RSS XML feeds.
+                </p>
               </div>
+
+              {isYouTubeOrTed && (
+                <div style={{
+                  padding: '10px 14px',
+                  borderRadius: 'var(--radius-md)',
+                  background: 'rgba(245, 158, 11, 0.12)',
+                  border: '1px solid rgba(245, 158, 11, 0.35)',
+                  color: '#fbbf24',
+                  fontSize: '0.8rem',
+                  lineHeight: '1.4',
+                }}>
+                  <strong>Notice:</strong> YouTube and TED URLs do not provide direct media files and cannot be downloaded directly due to platform streaming protections. To index this recording, save the audio/video file locally and upload it using the <strong>Upload File</strong> tab.
+                </div>
+              )}
               <div>
                 <label style={{ display: 'block', fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '6px' }}>
                   Episode Title Filter (Optional for podcasts)

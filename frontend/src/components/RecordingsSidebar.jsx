@@ -146,6 +146,19 @@ export default function RecordingsSidebar({
                     {rec.chunk_count > 0 ? `${rec.chunk_count} chunks` : ''}
                   </span>
                 </div>
+
+                {rec.status === 'failed' && rec.error_message && (
+                  <p style={{
+                    fontSize: '0.72rem',
+                    color: '#fda4af',
+                    marginTop: '6px',
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                  }} title={rec.error_message}>
+                    ⚠️ {rec.error_message}
+                  </p>
+                )}
               </div>
             );
           })
