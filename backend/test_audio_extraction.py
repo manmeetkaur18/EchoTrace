@@ -12,7 +12,7 @@ from app.services.audio_service import extract_audio_from_video
 
 def test_audio_extraction():
     # 1. Define input video path
-    video_path = BACKEND_DIR / "data" / "uploads" / "0cff7030-105a-4a6d-ae7b-4b1cf8ec6f04.mp4"
+    video_path = BACKEND_DIR / "data" / "uploads" / "5aa51179-2c02-4def-ab08-015caf455998.mp4"
     print(f"--- Audio Extraction Test ---")
     print(f"Input video path: {video_path}")
 
